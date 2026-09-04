@@ -284,16 +284,18 @@ def _pipeline_functions(
         nonlocal previous_state, previous_time
         current = observation.robot_state
         started = time.monotonic()
+        obs_time = float(observation.timestamp)
         if previous_state is None or previous_time is None:
             velocity = np.zeros_like(current)
         else:
-            dt = max(1e-4, started - previous_time)
+            dt = max(1e-4, obs_time - previous_time)
             velocity = (current - previous_state) / dt
         previous_state = current.copy()
-        previous_time = started
+        previous_time = obs_time
 
         state = torch.from_numpy(current).to(device=device, dtype=dtype).unsqueeze(0)
         vel = torch.from_numpy(velocity).to(device=device, dtype=dtype).unsqueeze(0)
+        injected_latency = (action_delay_ms / 1000.0) if action_delay_ms else 0.0
         with torch.inference_mode(), torch.autocast(
             device_type="cuda",
             dtype=dtype,
@@ -302,11 +304,13 @@ def _pipeline_functions(
             if backbone_mode == "streaming-kv":
                 if stream is None:
                     raise RuntimeError("a frame must be encoded before planning")
+                # Add injected delay on top of tracked EMA compute latency
+                total_latency = stream.plan_latency_ema + injected_latency
                 chunk = stream.plan(
                     state,
                     vel,
                     plan_timestamp=started,
-                    inference_latency=action_delay_ms / 1000.0 if action_delay_ms else None,
+                    inference_latency=total_latency,
                 )
                 actions = chunk.actions
                 visual_age = chunk.visual_age
@@ -325,14 +329,14 @@ def _pipeline_functions(
                     started - (history_origin + history_timestamps[-1]),
                 )
                 age = torch.full((1,), visual_age, device=device, dtype=dtype)
-                latency = action_delay_ms / 1000.0 if action_delay_ms else 0.05
+                total_latency = 0.05 + injected_latency
                 actions = policy.predict_chunk(
                     moss_inputs,
                     state,
                     vel,
                     age,
                     query_delays=policy.default_query_delays(
-                        age, inference_latency=latency
+                        age, inference_latency=total_latency
                     ),
                 )[0].clamp(-1.0, 1.0)
         result = actions.float().cpu().numpy()

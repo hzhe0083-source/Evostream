@@ -479,30 +479,80 @@ class ModelContractTests(unittest.TestCase):
         self.assertGreater(float(backbone_gradient.abs().sum()), 0.0)
 
     def test_training_and_streaming_query_parity(self) -> None:
-        """The core P0 invariant: training and streaming decode the exact same actions."""
+        """The core P0 invariant: training and streaming decode the exact same actions under identical latency L."""
         policy = self._policy().eval()
         image = np.full((2, 2, 3), 128, dtype=np.uint8)
         state = torch.tensor([[0.5, -0.5]])
         delta = torch.tensor([[0.1, -0.1]])
+        fixed_latency = 0.05
 
-        # 1. Streaming path: prefill -> append frame -> plan with ephemeral queries
+        # 1. Streaming path: prefill -> append frame -> plan with fixed latency
         processor = FakeProcessor()
         session = policy.create_stream(processor, "pick up the cube")
         session.append_frame(image, timestamp=0.0)
-        streamed_chunk = session.plan(state, delta, plan_timestamp=0.0)
+        streamed_chunk = session.plan(
+            state, delta, plan_timestamp=0.0, inference_latency=fixed_latency
+        )
 
-        # 2. Training path: prepare_streaming_moss_inputs -> predict_chunk (all-at-once)
+        # 2. Training path: prepare_streaming_moss_inputs -> predict_chunk with identical latency
         from data import prepare_streaming_moss_inputs
         moss_inputs = prepare_streaming_moss_inputs(
             processor, [[image]], ["pick up the cube"], [[0.0]]
         )
+        delays = policy.default_query_delays(
+            torch.tensor([0.0]), inference_latency=fixed_latency
+        )
         trained_chunk = policy.predict_chunk(
-            moss_inputs, state, delta, torch.tensor([0.0])
+            moss_inputs, state, delta, torch.tensor([0.0]), query_delays=delays
         )
 
         torch.testing.assert_close(
             streamed_chunk.actions, trained_chunk[0], atol=1e-4, rtol=1e-4
         )
+
+    def test_batched_vs_unbatched_query_parity(self) -> None:
+        """P0 regression test: Batch forward must yield identical actions as running each sample unbatched."""
+        policy = self._policy().eval()
+        processor = FakeProcessor()
+        from data import prepare_streaming_moss_inputs
+
+        image_a = np.full((2, 2, 3), 100, dtype=np.uint8)
+        image_b1 = np.full((2, 2, 3), 150, dtype=np.uint8)
+        image_b2 = np.full((2, 2, 3), 200, dtype=np.uint8)
+
+        # Sample A: 1 frame
+        # Sample B: 2 frames (different sequence length, different vision token count)
+        inputs_a = prepare_streaming_moss_inputs(
+            processor, [[image_a]], ["task a"], [[0.0]]
+        )
+        inputs_b = prepare_streaming_moss_inputs(
+            processor, [[image_b1, image_b2]], ["task b long instruction"], [[0.0, 0.1]]
+        )
+        inputs_batched = prepare_streaming_moss_inputs(
+            processor, [[image_a], [image_b1, image_b2]], ["task a", "task b long instruction"], [[0.0], [0.0, 0.1]]
+        )
+
+        state_a = torch.tensor([[0.2, -0.3]])
+        vel_a = torch.tensor([[0.05, -0.05]])
+        state_b = torch.tensor([[-0.4, 0.6]])
+        vel_b = torch.tensor([[-0.08, 0.08]])
+
+        state_batched = torch.cat((state_a, state_b), dim=0)
+        vel_batched = torch.cat((vel_a, vel_b), dim=0)
+        age_batched = torch.tensor([0.0, 0.1])
+        fixed_l = 0.05
+
+        delays_a = policy.default_query_delays(torch.tensor([0.0]), inference_latency=fixed_l)
+        delays_b = policy.default_query_delays(torch.tensor([0.1]), inference_latency=fixed_l)
+        delays_batched = policy.default_query_delays(age_batched, inference_latency=fixed_l)
+
+        chunk_a = policy.predict_chunk(inputs_a, state_a, vel_a, torch.tensor([0.0]), query_delays=delays_a)
+        chunk_b = policy.predict_chunk(inputs_b, state_b, vel_b, torch.tensor([0.1]), query_delays=delays_b)
+        chunk_batched = policy.predict_chunk(inputs_batched, state_batched, vel_batched, age_batched, query_delays=delays_batched)
+
+        # Assert batched[0] == single_a and batched[1] == single_b
+        torch.testing.assert_close(chunk_batched[0], chunk_a[0], atol=5e-4, rtol=5e-4)
+        torch.testing.assert_close(chunk_batched[1], chunk_b[0], atol=5e-4, rtol=5e-4)
 
     def test_valid_mask_excludes_padded_tail_actions(self) -> None:
         policy = self._policy().eval()
@@ -630,17 +680,18 @@ class ModelContractTests(unittest.TestCase):
         processor = FakeProcessor()
 
         # Path A: frame0 -> plan (creates ephemeral KV) -> rollback -> frame1 -> plan
+        fixed_l = 0.05
         session_a = policy.create_stream(processor, "pick up the cube")
         session_a.append_frame(np.zeros((2, 2, 3), dtype=np.uint8), timestamp=0.0)
-        _ = session_a.plan(torch.zeros(1, 2), torch.zeros(1, 2), plan_timestamp=0.05)
+        _ = session_a.plan(torch.zeros(1, 2), torch.zeros(1, 2), plan_timestamp=0.05, inference_latency=fixed_l)
         session_a.append_frame(np.full((2, 2, 3), 255, dtype=np.uint8), timestamp=0.1)
-        chunk_a = session_a.plan(torch.zeros(1, 2), torch.zeros(1, 2), plan_timestamp=0.1)
+        chunk_a = session_a.plan(torch.zeros(1, 2), torch.zeros(1, 2), plan_timestamp=0.1, inference_latency=fixed_l)
 
         # Path B: frame0 -> frame1 -> plan (clean, never planned at t=0.05)
         session_b = policy.create_stream(processor, "pick up the cube")
         session_b.append_frame(np.zeros((2, 2, 3), dtype=np.uint8), timestamp=0.0)
         session_b.append_frame(np.full((2, 2, 3), 255, dtype=np.uint8), timestamp=0.1)
-        chunk_b = session_b.plan(torch.zeros(1, 2), torch.zeros(1, 2), plan_timestamp=0.1)
+        chunk_b = session_b.plan(torch.zeros(1, 2), torch.zeros(1, 2), plan_timestamp=0.1, inference_latency=fixed_l)
 
         # Assert zero drift
         torch.testing.assert_close(chunk_a.actions, chunk_b.actions, atol=1e-6, rtol=1e-6)
@@ -689,7 +740,7 @@ class ModelContractTests(unittest.TestCase):
 
     def test_realtime_mrope_reserves_the_visual_grid(self) -> None:
         input_ids = torch.tensor([[5, 99, 6]])
-        text, vision, next_position = _realtime_mrope_positions(
+        text, vision, next_positions = _realtime_mrope_positions(
             input_ids,
             torch.tensor([[1, 4, 6]]),
             10,
@@ -700,7 +751,42 @@ class ModelContractTests(unittest.TestCase):
         self.assertEqual(text[:, 0, 1].tolist(), [14, 14, 14])
         self.assertEqual(text[:, 0, 2].tolist(), [15, 15, 15])
         self.assertEqual(vision.shape, (3, 1, 7))
-        self.assertEqual(next_position, 16)
+        self.assertEqual(int(next_positions[0]), 16)
+
+    def test_realtime_mrope_batch_padding_and_per_sample_next_positions(self) -> None:
+        """P0 regression test: padding does not advance position counter, next_pos is per-sample, vision_pos is [3, B, V_max]."""
+        # Sample 0: 3 valid tokens (1 frame) + 2 padding tokens
+        # Sample 1: 5 valid tokens (2 frames)
+        input_ids = torch.tensor([
+            [10, 99, 11, 0, 0],
+            [10, 99, 11, 99, 11],
+        ])
+        att_mask = torch.tensor([
+            [1, 1, 1, 0, 0],
+            [1, 1, 1, 1, 1],
+        ], dtype=torch.bool)
+        grid_thw = torch.tensor([
+            [1, 4, 4],  # sample 0 frame 0
+            [1, 4, 4],  # sample 1 frame 0
+            [1, 4, 4],  # sample 1 frame 1
+        ])
+        text_pos, vis_pos, next_pos = _realtime_mrope_positions(
+            input_ids,
+            grid_thw,
+            start=0,
+            image_token_id=99,
+            merge_size=2,
+            attention_mask=att_mask,
+        )
+        # 1. Padding tokens in sample 0 must be 0
+        np.testing.assert_array_equal(text_pos[:, 0, 3:].numpy(), np.zeros((3, 2)))
+        # 2. next_positions must be independent per-sample:
+        # Sample 0 has 1 frame + 2 text tokens -> next_pos[0] = 5
+        # Sample 1 has 2 frames + 3 text tokens -> next_pos[1] = 9
+        self.assertEqual(int(next_pos[0]), 5)
+        self.assertEqual(int(next_pos[1]), 9)
+        # 3. Vision position IDs must have shape [3, B, V_max] = [3, 2, 10]
+        self.assertEqual(vis_pos.shape, (3, 2, 10))
 
     def test_checkpoint_audit_allows_only_deleted_layers(self) -> None:
         info = {
@@ -1102,10 +1188,12 @@ def run_streaming_parity(argv: list[str]) -> None:
                 "mean_abs": float(difference.mean()),
             }
 
-    # Action Query and Rollback Parity verification
+    # Action Query and Rollback Parity verification with identical fixed latency L
     dummy_state = torch.zeros(1, policy.config.state_dim, device=device, dtype=dtype)
     dummy_vel = torch.zeros(1, policy.config.state_dim, device=device, dtype=dtype)
     zero_age = torch.zeros(1, device=device, dtype=dtype)
+    fixed_l = 0.05
+    fixed_delays = policy.default_query_delays(zero_age, inference_latency=fixed_l)
 
     with torch.inference_mode(), torch.autocast(
         device_type="cuda",
@@ -1114,11 +1202,13 @@ def run_streaming_parity(argv: list[str]) -> None:
     ):
         # 1. Action chunk parity (training full forward vs streaming cache decode)
         full_chunk = policy.predict_chunk(
-            first_full_inputs, dummy_state, dummy_vel, zero_age
+            first_full_inputs, dummy_state, dummy_vel, zero_age, query_delays=fixed_delays
         )[0].float().cpu()
         stream_chunk = policy.create_stream(processor, args.instruction)
         stream_chunk.append_frame(image, timestamp=0.0)
-        cached_plan = stream_chunk.plan(dummy_state, dummy_vel, plan_timestamp=0.0).actions.float().cpu()
+        cached_plan = stream_chunk.plan(
+            dummy_state, dummy_vel, plan_timestamp=0.0, inference_latency=fixed_l
+        ).actions.float().cpu()
         torch.testing.assert_close(full_chunk, cached_plan, atol=args.atol, rtol=args.rtol)
         action_diff = (full_chunk - cached_plan).abs()
 
@@ -1126,15 +1216,15 @@ def run_streaming_parity(argv: list[str]) -> None:
         # Path A: frame0 -> plan (rollback) -> frame1 -> plan
         sess_a = policy.create_stream(processor, args.instruction)
         sess_a.append_frame(image, timestamp=0.0)
-        _ = sess_a.plan(dummy_state, dummy_vel, plan_timestamp=0.05)
+        _ = sess_a.plan(dummy_state, dummy_vel, plan_timestamp=0.05, inference_latency=fixed_l)
         sess_a.append_frame(image, timestamp=0.1)
-        plan_a = sess_a.plan(dummy_state, dummy_vel, plan_timestamp=0.1).actions.float().cpu()
+        plan_a = sess_a.plan(dummy_state, dummy_vel, plan_timestamp=0.1, inference_latency=fixed_l).actions.float().cpu()
 
         # Path B: frame0 -> (no plan) -> frame1 -> plan
         sess_b = policy.create_stream(processor, args.instruction)
         sess_b.append_frame(image, timestamp=0.0)
         sess_b.append_frame(image, timestamp=0.1)
-        plan_b = sess_b.plan(dummy_state, dummy_vel, plan_timestamp=0.1).actions.float().cpu()
+        plan_b = sess_b.plan(dummy_state, dummy_vel, plan_timestamp=0.1, inference_latency=fixed_l).actions.float().cpu()
 
         torch.testing.assert_close(plan_a, plan_b, atol=args.atol, rtol=args.rtol)
         rollback_diff = (plan_a - plan_b).abs()

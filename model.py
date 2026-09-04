@@ -183,20 +183,27 @@ def _realtime_mrope_positions(
     start: int,
     image_token_id: int,
     merge_size: int,
-) -> tuple[torch.Tensor, torch.Tensor, int]:
-    """Build MOSS XRoPE positions for arbitrary batch sizes and frame counts."""
+    attention_mask: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build MOSS XRoPE positions with correct padding handling, per-sample next_pos, and [3, B, V_max] vision positions."""
     batch_size, seq_len = input_ids.shape
     positions = torch.zeros(
         3, batch_size, seq_len, dtype=torch.long, device=input_ids.device
     )
-    all_vision_chunks = []
+    sample_vision_pos_list = []
     frame_offset = 0
-    max_next_position = start
+    next_positions = torch.zeros(
+        batch_size, dtype=torch.long, device=input_ids.device
+    )
 
     for b in range(batch_size):
         current = start
-        sample_vision_chunks = []
+        sample_chunks = []
         for token_index, token in enumerate(input_ids[b]):
+            # Skip padding tokens: do not advance position counter, position is 0
+            if attention_mask is not None and not bool(attention_mask[b, token_index]):
+                positions[:, b, token_index] = 0
+                continue
             if int(token) != image_token_id:
                 positions[:, b, token_index] = current
                 current += 1
@@ -214,7 +221,7 @@ def _realtime_mrope_positions(
                 (base, base + y, base + x), dim=0
             ).reshape(3, -1)
             separator = current + max(height, width)
-            sample_vision_chunks.append(
+            sample_chunks.append(
                 torch.cat(
                     (
                         grid_positions,
@@ -228,20 +235,31 @@ def _realtime_mrope_positions(
             positions[:, b, token_index] = separator
             current = separator + 1
             frame_offset += 1
-        max_next_position = max(max_next_position, current)
-        if sample_vision_chunks:
-            all_vision_chunks.append(torch.cat(sample_vision_chunks, dim=1))
+        next_positions[b] = current
+        if sample_chunks:
+            sample_vision_pos_list.append(torch.cat(sample_chunks, dim=1))
+        else:
+            sample_vision_pos_list.append(
+                torch.zeros(3, 0, dtype=torch.long, device=input_ids.device)
+            )
 
     if frame_offset != len(grid_thw):
         raise ValueError(
             f"stream segment image tokens ({frame_offset}) mismatch frames ({len(grid_thw)})"
         )
-    vision_positions = (
-        torch.cat(all_vision_chunks, dim=1).unsqueeze(1)
-        if all_vision_chunks
-        else torch.zeros(3, 1, 0, dtype=torch.long, device=input_ids.device)
+
+    # Pad vision_positions to [3, batch_size, max_vision_tokens]
+    max_vision_tokens = max(
+        (chunk.shape[1] for chunk in sample_vision_pos_list), default=0
     )
-    return positions, vision_positions, max_next_position
+    vision_positions = torch.zeros(
+        3, batch_size, max_vision_tokens, dtype=torch.long, device=input_ids.device
+    )
+    for b, chunk in enumerate(sample_vision_pos_list):
+        if chunk.shape[1] > 0:
+            vision_positions[:, b, : chunk.shape[1]] = chunk
+
+    return positions, vision_positions, next_positions
 
 
 class TruncatedMossBackbone(nn.Module):
@@ -348,13 +366,22 @@ class TruncatedMossBackbone(nn.Module):
                 dtype=self.moss.get_input_embeddings().weight.dtype,
             )
 
-            text_pos, vis_pos, next_position = _realtime_mrope_positions(
-                input_ids, grid_thw, 0, image_token_id, merge_size
+            raw_attention = values.get("attention_mask")
+            if raw_attention is None:
+                raw_attention = torch.ones_like(input_ids)
+            text_pos, vis_pos, next_positions = _realtime_mrope_positions(
+                input_ids,
+                grid_thw,
+                0,
+                image_token_id,
+                merge_size,
+                attention_mask=raw_attention,
             )
+            # Per-sample distinct starting position: p_j^(b) = next_pos[b] + j
             query_pos = (
-                next_position
-                + torch.arange(queries, device=input_ids.device)
-            ).view(1, 1, -1).expand(3, batch, -1)
+                next_positions[None, :, None]
+                + torch.arange(queries, device=input_ids.device)[None, None, :]
+            ).expand(3, -1, -1)
             full_text_pos = torch.cat((text_pos, query_pos), dim=-1)
 
             prefix_embeds = self.moss.get_input_embeddings()(input_ids)
@@ -362,9 +389,6 @@ class TruncatedMossBackbone(nn.Module):
                 (prefix_embeds, query_embeds.to(prefix_embeds)), dim=1
             )
 
-            raw_attention = values.get("attention_mask")
-            if raw_attention is None:
-                raw_attention = torch.ones_like(input_ids)
             query_attention = torch.ones(
                 batch, queries, dtype=raw_attention.dtype, device=raw_attention.device
             )
@@ -487,13 +511,14 @@ class TruncatedMossBackbone(nn.Module):
         config = self.moss.config
         image_token_id = int(config.image_token_id)
         merge_size = int(self.moss.visual.spatial_merge_size)
-        text_positions, vision_positions, next_position = _realtime_mrope_positions(
+        text_positions, vision_positions, next_positions = _realtime_mrope_positions(
             input_ids,
             grid_thw,
             state.next_text_position,
             image_token_id,
             merge_size,
         )
+        next_position = int(next_positions[0].item())
 
         vision_method = getattr(self.moss, "get_vision_features_chunked", None)
         if not callable(vision_method):
@@ -876,23 +901,6 @@ class MossActionVLA(nn.Module):
             visual_age,
             query_delays=query_delays,
         )
-        target = actions.to(predicted)
-        if target.shape != predicted.shape:
-            raise ValueError(
-                f"actions must have shape {tuple(predicted.shape)}, got {tuple(target.shape)}"
-            )
-        errors = (predicted - target).abs().mean(dim=-1)
-        if valid_mask is None:
-            loss = errors.mean()
-        else:
-            weights = valid_mask.to(errors)
-            if weights.shape != errors.shape:
-                raise ValueError("valid_mask must align with the action chunk")
-            total = weights.sum()
-            if not bool(total > 0):
-                raise ValueError("every planning time needs at least one valid action")
-            loss = (errors * weights).sum() / total
-        return {"loss": loss, "predicted_actions": predicted}
         target = actions.to(predicted)
         if target.shape != predicted.shape:
             raise ValueError(
