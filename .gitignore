@@ -11,6 +11,7 @@ __pycache__/
 
 # Training outputs
 /checkpoints/
+/evaluation.json
 
 # Conductor control room (session-local state; not shared via git)
 /.conductor/

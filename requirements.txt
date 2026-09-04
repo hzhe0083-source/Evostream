@@ -3,11 +3,12 @@
 
 torch==2.8.0+cu128
 torchvision==0.23.0+cu128
-transformers==4.57.1
+transformers==4.57.3
 accelerate==1.12.0
 flash-attn==2.8.1
 torchcodec==0.7.0
 numpy==2.4.3
+h5py>=3.11
 pillow==12.1.1
 joblib==1.5.2
 einops==0.8.2
