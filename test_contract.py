@@ -7,6 +7,7 @@ import gc
 import json
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -452,20 +453,31 @@ class ModelContractTests(unittest.TestCase):
         self.assertIsNotNone(backbone_gradient)
         self.assertGreater(float(backbone_gradient.abs().sum()), 0.0)
 
-    def test_training_requires_exactly_one_planning_time_per_sample(self) -> None:
-        policy = self._policy()
-        two_readouts = torch.zeros(2, 7, dtype=torch.bool)
-        two_readouts[0, [2, 5]] = True
-        two_readouts[1, 4] = True
-        with self.assertRaises(ValueError):
-            policy(
-                self._inputs(),
-                torch.randn(2, 2),
-                torch.randn(2, 2),
-                torch.randn(2, 4, 3),
-                torch.zeros(2),
-                action_token_mask=two_readouts,
-            )
+    def test_training_and_streaming_query_parity(self) -> None:
+        """The core P0 invariant: training and streaming decode the exact same actions."""
+        policy = self._policy().eval()
+        image = np.full((2, 2, 3), 128, dtype=np.uint8)
+        state = torch.tensor([[0.5, -0.5]])
+        delta = torch.tensor([[0.1, -0.1]])
+
+        # 1. Streaming path: prefill -> append frame -> plan with ephemeral queries
+        processor = FakeProcessor()
+        session = policy.create_stream(processor, "pick up the cube")
+        session.append_frame(image, timestamp=0.0)
+        streamed_chunk = session.plan(state, delta, plan_timestamp=0.0)
+
+        # 2. Training path: prepare_streaming_moss_inputs -> predict_chunk (all-at-once)
+        from data import prepare_streaming_moss_inputs
+        moss_inputs = prepare_streaming_moss_inputs(
+            processor, [[image]], ["pick up the cube"], [[0.0]]
+        )
+        trained_chunk = policy.predict_chunk(
+            moss_inputs, state, delta, torch.tensor([0.0])
+        )
+
+        torch.testing.assert_close(
+            streamed_chunk.actions, trained_chunk[0], atol=1e-5, rtol=1e-5
+        )
 
     def test_valid_mask_excludes_padded_tail_actions(self) -> None:
         policy = self._policy().eval()
@@ -588,6 +600,42 @@ class ModelContractTests(unittest.TestCase):
                 ).actions
             )
         self.assertFalse(torch.allclose(chunks[0], chunks[1]))
+
+    def test_concurrent_append_and_plan_is_thread_safe(self) -> None:
+        """P0 regression test: session mutex prevents cache corruption under concurrency."""
+        import threading
+        policy = self._policy().eval()
+        session = policy.create_stream(FakeProcessor(), "pick up the cube")
+        session.append_frame(np.zeros((2, 2, 3), dtype=np.uint8), timestamp=0.0)
+        errors: list[BaseException] = []
+
+        def appender():
+            try:
+                for i in range(1, 15):
+                    session.append_frame(
+                        np.full((2, 2, 3), i, dtype=np.uint8), timestamp=0.05 * i
+                    )
+                    time.sleep(0.002)
+            except BaseException as e:
+                errors.append(e)
+
+        def planner():
+            try:
+                for i in range(25):
+                    session.plan(
+                        torch.zeros(1, 2), torch.zeros(1, 2), plan_timestamp=0.03 * i
+                    )
+                    time.sleep(0.001)
+            except BaseException as e:
+                errors.append(e)
+
+        t1 = threading.Thread(target=appender)
+        t2 = threading.Thread(target=planner)
+        t1.start(); t2.start()
+        t1.join(); t2.join()
+
+        self.assertEqual(errors, [])
+        self.assertEqual(session.state.frame_count, 15)
 
     def test_planning_requires_a_frame_first(self) -> None:
         policy = self._policy().eval()
@@ -909,8 +957,8 @@ def run_streaming_parity(argv: list[str]) -> None:
         from model import checkpoint_fingerprint, load_trainable_state_dict
 
         payload = torch.load(args.policy, map_location="cpu", weights_only=True)
-        if payload.get("format") != "moss_action_v5":
-            raise ValueError("streaming parity policy must be moss_action_v5")
+        if payload.get("format") != "moss_action_v6":
+            raise ValueError("streaming parity policy must be moss_action_v6")
         if (
             payload["moss_checkpoint"]["combined_sha256"]
             != checkpoint_fingerprint(checkpoint)["combined_sha256"]

@@ -153,7 +153,7 @@ def _build_policy(args: argparse.Namespace, initial: dict[str, Any] | None):
         else MossActionConfig(
             moss_hidden_size=hidden_size,
             chunk_size=args.chunk_size,
-            control_interval=args.frame_interval * args.frame_stride,
+            control_interval=args.frame_interval,
         )
     )
     if config.moss_hidden_size != hidden_size:

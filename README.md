@@ -47,11 +47,9 @@ data/demo_N/obs/gripper_states             [T, 2]
 data.attrs.problem_info.language_instruction
 ```
 
-图像只做一次 OpenGL 垂直翻转。状态用训练集 1%/99% 分位归一化；动作保持 LIBERO 原始 OSC `[-1,1]` 语义。每个时刻执行 `instruction + frames[0:t] + state[t] + action_state[t] → velocity[t]`；每帧间隔默认为 `0.1 s`。可用 `--frame-stride`、`--frame-interval` 调整采样时间，如数据记录语义不同可用 `--action-offset 0` 校准。
+图像只做一次 OpenGL 垂直翻转。状态用训练集 1%/99% 分位归一化；动作保持 LIBERO 原始 OSC `[-1,1]` 语义。每个时刻执行 `instruction + frames[0:t-visual_age] + state[t] + Δstate[t] + K queries → actions[t:t+K]`；每帧间隔默认为 `0.1 s`。可用 `--frame-stride`、`--frame-interval` 调整采样时间，如数据记录语义不同可用 `--action-offset 0` 校准。
 
-Streaming Flow 默认使用 `--initial-action-noise 0.1 --stabilization 10`。前者控制多样性与重启扰动，后者控制偏离示范轨迹后的回拉强度；两者属于实机校准参数，恢复训练时必须保持一致。
-
-动作目标采用 [Streaming Flow Policy](https://arxiv.org/abs/2505.21851) 的 action-space conditional flow：把动作轨迹本身作为 flow trajectory，而不是在每个观测上生成“trajectory of trajectories”。本项目额外允许 MOSS memory 在相邻 action step 之间刷新。
+动作头采用 **Streaming Action Query Decoder**：K 个临时动作查询嵌入进入 24 层 MOSS 骨干网络（通过内部 Self-Attention 读文本指令与状态条件，通过 Gated Cross-Attention 读增量视觉 KV），由轻量 L1 回归 MLP 一次性预测连续 micro-chunk。生成完成后临时查询的 KV 被立刻截断，保证已执行历史不被旧计划污染。训练时使用 delay-aware 视觉采样模拟异步运行时的视觉延迟。
 
 ## 1. 无权重检查
 
@@ -110,19 +108,19 @@ python train.py train \
   --batch-size 1 --gradient-accumulation 8 --epochs 10
 ```
 
-长训练前可先固定一条样本和 Flow 噪声做过拟合检查：
+长训练前可先固定一条样本做过拟合检查：
 
 ```bash
 python train.py train \
   --moss-checkpoint /absolute/path/to/MOSS-VL-Realtime \
   --data /absolute/path/to/libero/datasets \
-  --overfit-one --fixed-flow-noise \
+  --overfit-one \
   --frame-stride 1 --frame-interval 0.1 \
   --batch-size 1 --epochs 500 --max-steps 500 \
   --output checkpoints/overfit_one.pt
 ```
 
-checkpoint 保存视觉编码器、保留的 24 层 MOSS 和 Action Expert 的完整微调权重；加载时仍验证基础 Realtime checkpoint 的 SHA256。
+checkpoint 保存视觉编码器、保留的 24 层 MOSS 和 Action Query Decoder 的完整微调权重；加载时仍验证基础 Realtime checkpoint 的 SHA256。
 
 部署前再对完整微调权重执行一次 KV parity：
 
@@ -145,13 +143,13 @@ python evaluate.py \
   --output evaluation.json
 ```
 
-调试过拟合样本时加 `--fixed-noise`，可在相同观测下复现完全相同的 Flow 初始噪声。
+评测支持通过 `--ensemble-lambda 2.0` 启用 ACT 式时间加权平滑（不传则最新 chunk 胜出，直接暴露边界跳变用于纯粹度量）。
 
-输出包含每任务成功率、task-macro success、perception/action-flow latency、两路频率、编码帧数、重复动作比例和 action age。`--mode blocking` 是执行调度对照；`--backbone-mode full-recompute` 是关闭增量 KV 的模型计算对照。
+输出包含每任务成功率、task-macro success、planner latency、两路频率、编码帧数、chunk stalls 和边界跳变（boundary jump / step delta）。`--mode blocking` 是执行调度对照；`--backbone-mode full-recompute` 是关闭增量 KV 的模型计算对照。
 
 用 `--action-delay-ms 100`（或其他延迟）可直接做异步鲁棒性曲线。
 
-`moss_action_v5` 将动作块 Flow 改为逐动作 Streaming Flow，并采用全参数、完整 episode 的 causal 训练；拒绝加载更早动作头，需要重新训练。
+`moss_action_v6` 采用增量视觉 KV + 临时 Action Query + 连续 micro-chunk L1 解码，并在训练时使用单 planning time 的 delay-aware 视觉采样；拒绝加载更早格式 checkpoint，需要重新训练。
 
 ## 暂不包含
 

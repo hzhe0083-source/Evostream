@@ -13,6 +13,7 @@ import copy
 import hashlib
 import math
 import re
+import threading
 import time
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager, nullcontext
@@ -291,6 +292,48 @@ class TruncatedMossBackbone(nn.Module):
         inputs["use_cache"] = False
         _, taps = self._forward_with_taps(inputs)
         return taps
+
+    def forward_with_queries(
+        self,
+        moss_inputs: Mapping[str, Any],
+        query_embeds: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run full backbone with action queries appended, return queries' hidden states.
+
+        This is the exact full-recompute analogue of `decode_action_queries`: the
+        queries are appended to the prefix embeddings, attend to all prior text
+        and all visual frames through all 24 layers, and produce post-final-norm
+        states for the action MLP.
+        """
+        values = dict(moss_inputs)
+        values.pop("labels", None)
+        values["use_cache"] = False
+        batch, queries, width = query_embeds.shape
+
+        input_ids = values.pop("input_ids", None)
+        inputs_embeds = values.pop("inputs_embeds", None)
+        if inputs_embeds is None:
+            if input_ids is None:
+                raise ValueError("backbone requires input_ids or inputs_embeds")
+            inputs_embeds = self.moss.get_input_embeddings()(input_ids)
+
+        if inputs_embeds.shape[0] != batch:
+            raise ValueError("query batch size must match moss_inputs")
+        full_embeds = torch.cat(
+            (inputs_embeds, query_embeds.to(inputs_embeds)), dim=1
+        )
+        values["inputs_embeds"] = full_embeds
+
+        mask = values.get("attention_mask")
+        if mask is not None:
+            query_mask = torch.ones(
+                batch, queries, dtype=mask.dtype, device=mask.device
+            )
+            values["attention_mask"] = torch.cat((mask, query_mask), dim=1)
+
+        output = self.moss(**values)
+        hidden = _layer_tensor(output)
+        return hidden[:, -queries:]
 
     @torch.no_grad()
     def start_stream(
@@ -700,47 +743,28 @@ class MossActionVLA(nn.Module):
         query_delays: torch.Tensor | None = None,
         action_token_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Full-recompute path: one planning time per sample."""
+        """Full-recompute path: one planning time per sample.
+
+        Action queries are appended to the prefix and run through all 24 layers,
+        matching the exact compute graph of `decode_action_queries` at deploy.
+        """
+        batch = robot_state.shape[0]
+        if visual_age.ndim == 0:
+            visual_age = visual_age.expand(batch)
+        if query_delays is None:
+            query_delays = self.default_query_delays(visual_age)
+        condition = self.decoder.condition(
+            robot_state, state_difference, visual_age
+        )
+        queries = self.decoder.query_embeddings(condition, query_delays)
         needs_backbone_grad = any(
             parameter.requires_grad for parameter in self.backbone.parameters()
         )
         with nullcontext() if needs_backbone_grad else torch.no_grad():
-            taps = self.backbone(**dict(moss_inputs))
-        hidden, text_mask = taps.hidden[-1], taps.text_mask
-        if action_token_mask is not None:
-            if action_token_mask.shape != text_mask.shape:
-                raise ValueError("action_token_mask must align with MOSS text tokens")
-            selected = action_token_mask.to(
-                device=text_mask.device, dtype=torch.bool
-            ) & text_mask.bool()
-            counts = selected.sum(dim=1)
-            if not bool((counts == 1).all()):
-                raise ValueError(
-                    "single-planning-time training needs exactly one readout token "
-                    f"per sample, got {counts.tolist()}"
-                )
-            prefix = hidden[selected]
-        else:
-            positions = torch.arange(text_mask.shape[1], device=text_mask.device)
-            last = (
-                positions.expand_as(text_mask)
-                .masked_fill(~text_mask.bool(), -1)
-                .max(1)
-                .values
+            query_hidden = self.backbone.forward_with_queries(
+                moss_inputs, queries
             )
-            rows = torch.arange(text_mask.shape[0], device=text_mask.device)
-            prefix = hidden[rows, last]
-        if visual_age.ndim == 0:
-            visual_age = visual_age.expand(prefix.shape[0])
-        if query_delays is None:
-            query_delays = self.default_query_delays(visual_age)
-        condition = self.decoder.condition(
-            robot_state.to(prefix), state_difference.to(prefix), visual_age.to(prefix)
-        )
-        queries = self.decoder.query_embeddings(condition, query_delays.to(prefix))
-        # The prefix summary reaches every query, so the queries stay a chunk-wide
-        # plan rather than K independent single-step regressions.
-        return self.decoder(queries + prefix.unsqueeze(1))
+        return self.decoder(query_hidden)
 
     def forward(
         self,
@@ -828,6 +852,7 @@ class StreamingMossActionSession:
         self.origin_timestamp: float | None = None
         self.last_timestamp: float | None = None
         self.last_frame_timestamp: float | None = None
+        self._lock = threading.Lock()
 
     def _append_frame(
         self,
@@ -835,31 +860,32 @@ class StreamingMossActionSession:
         *,
         timestamp: float | None = None,
     ) -> BackboneTaps:
-        timestamp = time.monotonic() if timestamp is None else float(timestamp)
-        if not math.isfinite(timestamp):
-            raise ValueError("stream timestamp must be finite")
-        if self.last_timestamp is not None and timestamp < self.last_timestamp:
-            raise ValueError("stream timestamps must be non-decreasing")
-        if self.origin_timestamp is None:
-            self.origin_timestamp = timestamp
-        self.last_timestamp = timestamp
-        segment = realtime_frame_segment(timestamp - self.origin_timestamp)
-        frame_inputs = dict(
-            self.processor(
-                text=segment,
-                images=[image],
-                add_special_tokens=False,
-                return_tensors="pt",
+        with self._lock:
+            timestamp = time.monotonic() if timestamp is None else float(timestamp)
+            if not math.isfinite(timestamp):
+                raise ValueError("stream timestamp must be finite")
+            if self.last_timestamp is not None and timestamp < self.last_timestamp:
+                raise ValueError("stream timestamps must be non-decreasing")
+            if self.origin_timestamp is None:
+                self.origin_timestamp = timestamp
+            self.last_timestamp = timestamp
+            segment = realtime_frame_segment(timestamp - self.origin_timestamp)
+            frame_inputs = dict(
+                self.processor(
+                    text=segment,
+                    images=[image],
+                    add_special_tokens=False,
+                    return_tensors="pt",
+                )
             )
-        )
-        device = next(self.policy.parameters()).device
-        frame_inputs = {
-            key: value.to(device) if isinstance(value, torch.Tensor) else value
-            for key, value in frame_inputs.items()
-        }
-        taps = self.policy.backbone.append_stream_frame(self.state, frame_inputs)
-        self.last_frame_timestamp = timestamp
-        return taps
+            device = next(self.policy.parameters()).device
+            frame_inputs = {
+                key: value.to(device) if isinstance(value, torch.Tensor) else value
+                for key, value in frame_inputs.items()
+            }
+            taps = self.policy.backbone.append_stream_frame(self.state, frame_inputs)
+            self.last_frame_timestamp = timestamp
+            return taps
 
     def append_frame(self, image: Any, *, timestamp: float | None = None) -> None:
         """Grow the visual KV cache without planning."""
@@ -881,43 +907,44 @@ class StreamingMossActionSession:
         clamp: bool = True,
     ) -> ActionChunk:
         """Decode one micro-chunk from the committed prefix, then drop the queries."""
-        if self.last_frame_timestamp is None:
-            raise RuntimeError("a frame must be appended before planning")
-        plan_timestamp = (
-            time.monotonic() if plan_timestamp is None else float(plan_timestamp)
-        )
-        if not math.isfinite(plan_timestamp):
-            raise ValueError("plan timestamp must be finite")
-        visual_age = max(0.0, plan_timestamp - self.last_frame_timestamp)
-        device = next(self.policy.parameters()).device
-        dtype = self.policy.decoder.query_embedding.dtype
-        robot_state = robot_state.to(device=device, dtype=dtype)
-        state_difference = state_difference.to(device=device, dtype=dtype)
-        if robot_state.ndim == 1:
-            robot_state = robot_state.unsqueeze(0)
-        if state_difference.ndim == 1:
-            state_difference = state_difference.unsqueeze(0)
-        if robot_state.shape[0] != 1:
-            raise ValueError("a streaming session plans for one robot at a time")
-        age = torch.full((1,), visual_age, device=device, dtype=dtype)
-        delays = self.policy.default_query_delays(
-            age, inference_latency=inference_latency
-        )
-        condition = self.policy.decoder.condition(
-            robot_state, state_difference, age
-        )
-        queries = self.policy.decoder.query_embeddings(condition, delays)
-        hidden = self.policy.backbone.decode_action_queries(self.state, queries)
-        actions = self.policy.decoder(hidden)
-        if clamp:
-            actions = actions.clamp(-1.0, 1.0)
-        return ActionChunk(
-            actions=actions[0],
-            start_time=plan_timestamp + inference_latency,
-            plan_time=plan_timestamp,
-            interval=self.policy.config.control_interval,
-            visual_age=visual_age,
-        )
+        with self._lock:
+            if self.last_frame_timestamp is None:
+                raise RuntimeError("a frame must be appended before planning")
+            plan_timestamp = (
+                time.monotonic() if plan_timestamp is None else float(plan_timestamp)
+            )
+            if not math.isfinite(plan_timestamp):
+                raise ValueError("plan timestamp must be finite")
+            visual_age = max(0.0, plan_timestamp - self.last_frame_timestamp)
+            device = next(self.policy.parameters()).device
+            dtype = self.policy.decoder.query_embedding.dtype
+            robot_state = robot_state.to(device=device, dtype=dtype)
+            state_difference = state_difference.to(device=device, dtype=dtype)
+            if robot_state.ndim == 1:
+                robot_state = robot_state.unsqueeze(0)
+            if state_difference.ndim == 1:
+                state_difference = state_difference.unsqueeze(0)
+            if robot_state.shape[0] != 1:
+                raise ValueError("a streaming session plans for one robot at a time")
+            age = torch.full((1,), visual_age, device=device, dtype=dtype)
+            delays = self.policy.default_query_delays(
+                age, inference_latency=inference_latency
+            )
+            condition = self.policy.decoder.condition(
+                robot_state, state_difference, age
+            )
+            queries = self.policy.decoder.query_embeddings(condition, delays)
+            hidden = self.policy.backbone.decode_action_queries(self.state, queries)
+            actions = self.policy.decoder(hidden)
+            if clamp:
+                actions = actions.clamp(-1.0, 1.0)
+            return ActionChunk(
+                actions=actions[0],
+                start_time=plan_timestamp + inference_latency,
+                plan_time=plan_timestamp,
+                interval=self.policy.config.control_interval,
+                visual_age=visual_age,
+            )
 
     @torch.no_grad()
     def predict_chunk(

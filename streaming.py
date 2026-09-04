@@ -40,11 +40,13 @@ class PlannedChunk:
     visual_age: float
 
     def index_at(self, moment: float) -> int:
-        return int(max(0.0, moment - self.start_time) // self.interval)
+        if moment < self.start_time:
+            return -1
+        return int((moment - self.start_time) // self.interval)
 
     def action_at(self, moment: float) -> np.ndarray | None:
         index = self.index_at(moment)
-        if index >= len(self.actions):
+        if index < 0 or index >= len(self.actions):
             return None
         return self.actions[index]
 

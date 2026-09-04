@@ -197,15 +197,16 @@ class LiberoHDF5Dataset(Dataset):
 
         ref = self.samples[index]
         planning_time = self.planning_times[index]
-        age_steps = self._visual_age_steps(index)
+        # Stale-vision conditioning: the newest frame may be several steps behind
+        # the planning time, but cannot be before the start of the episode.
+        raw_age_steps = self._visual_age_steps(index)
+        age_steps = min(raw_age_steps, planning_time)
         # ponytail: reopen per sample for worker safety; cache handles only if I/O profiles hot.
         with h5py.File(ref.path, "r") as handle:
             demo = handle["data"][ref.demo]
             observations = demo["obs"]
 
-            # The newest visible frame is `age_steps` behind the planning time,
-            # which is what the asynchronous runtime delivers.
-            newest_frame = max(0, planning_time - age_steps)
+            newest_frame = planning_time - age_steps
             first_frame = max(
                 0, newest_frame - (self.context_frames - 1) * self.frame_stride
             )
