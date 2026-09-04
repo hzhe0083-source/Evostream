@@ -16,9 +16,9 @@ import numpy as np
 
 from streaming import (
     AsyncPerception,
-    LatestAction,
+    ChunkExecutor,
+    ChunkPlanner,
     LatestObservation,
-    StreamingActionWorker,
 )
 
 try:
@@ -27,6 +27,7 @@ try:
 
     from model import (
         TAP_LAYERS,
+        ActionChunk,
         MossActionConfig,
         MossActionVLA,
         TruncatedMossBackbone,
@@ -52,7 +53,7 @@ class StreamingContractTests(unittest.TestCase):
         self.assertEqual(observation.version, latest_version)
         self.assertEqual(observation.image, "new")
 
-    def test_perception_and_action_decoding_have_separate_mailboxes(self) -> None:
+    def test_perception_and_planning_have_separate_mailboxes(self) -> None:
         observations = LatestObservation()
         features = LatestObservation()
         perception = AsyncPerception(
@@ -70,26 +71,55 @@ class StreamingContractTests(unittest.TestCase):
         self.assertEqual(encoded.image, "encoded:frame")
         self.assertEqual(perception.frames_encoded, 1)
 
-    def test_action_worker_publishes_each_flow_step_immediately(self) -> None:
+    def test_executor_interpolates_a_chunk_across_control_ticks(self) -> None:
+        executor = ChunkExecutor(action_dim=2)
+        chunk = np.array([[0.0, 0.0], [1.0, 1.0], [2.0, 2.0]], dtype=np.float32)
+        executor.submit(chunk, start_time=10.0, interval=0.1)
+        np.testing.assert_allclose(executor.action_at(10.0), [0.0, 0.0])
+        np.testing.assert_allclose(executor.action_at(10.15), [1.0, 1.0])
+        np.testing.assert_allclose(executor.action_at(10.25), [2.0, 2.0])
+        with self.assertRaises(RuntimeError):
+            executor.action_at(10.45)
+
+    def test_newest_chunk_wins_without_ensembling(self) -> None:
+        executor = ChunkExecutor(action_dim=1)
+        executor.submit(np.zeros((4, 1), dtype=np.float32), 0.0, 0.1)
+        executor.submit(np.ones((4, 1), dtype=np.float32), 0.1, 0.1)
+        # Both chunks cover t=0.15; the unensembled executor must not average.
+        np.testing.assert_allclose(executor.action_at(0.15), [1.0])
+
+    def test_temporal_ensemble_blends_overlapping_chunks(self) -> None:
+        executor = ChunkExecutor(action_dim=1, ensemble_lambda=0.0)
+        executor.submit(np.zeros((4, 1), dtype=np.float32), 0.0, 0.1)
+        executor.submit(np.ones((4, 1), dtype=np.float32), 0.1, 0.1)
+        # Zero decay weights both plans equally, so the vote is the mean.
+        np.testing.assert_allclose(executor.action_at(0.15), [0.5])
+
+    def test_planner_submits_chunks_to_the_executor(self) -> None:
         features = LatestObservation()
-        actions = LatestAction(action_dim=2)
-        worker = StreamingActionWorker(
+        executor = ChunkExecutor(action_dim=2)
+        planner = ChunkPlanner(
             features,
-            actions,
-            lambda observation: np.asarray(observation.image, dtype=np.float32) + 1,
+            executor,
+            lambda observation: {
+                "actions": np.asarray(observation.image, dtype=np.float32),
+                "start_time": 0.0,
+                "interval": 1.0,
+                "visual_age": 0.25,
+            },
             period=0.01,
         )
-        worker.start()
+        planner.start()
         try:
-            features.publish([2, 3], np.zeros(2), timestamp=1.0)
-            action = actions.wait_for_new(0, timeout=1.0)
-            next_action = actions.wait_for_new(action.version, timeout=1.0)
+            features.publish([[2.0, 3.0], [4.0, 5.0]], np.zeros(2), timestamp=1.0)
+            self.assertTrue(planner.wait_for_first_chunk(1.0))
         finally:
-            worker.stop()
-        self.assertIsNotNone(action)
-        self.assertIsNotNone(next_action)
-        np.testing.assert_array_equal(action.value, [3, 4])
-        self.assertGreaterEqual(worker.actions_generated, 2)
+            planner.stop()
+        planner.raise_if_failed()
+        self.assertGreaterEqual(planner.chunks_planned, 1)
+        self.assertAlmostEqual(planner.last_visual_age, 0.25)
+        np.testing.assert_allclose(executor.action_at(0.0), [2.0, 3.0])
+        np.testing.assert_allclose(executor.action_at(1.0), [4.0, 5.0])
 
 
 if HAS_TORCH:
@@ -135,6 +165,9 @@ if HAS_TORCH:
     class FakeCache:
         def __init__(self):
             self.layers = [FakeCacheLayer() for _ in range(24)]
+            # Mirrors mllama: cross-attention layers retain vision K/V, so a
+            # later token batch attends to earlier frames without resending them.
+            self.vision_signal: Any = None
 
         def get_seq_length(self, layer_idx: int = 0) -> int:
             return self.layers[layer_idx].get_seq_length()
@@ -180,11 +213,16 @@ if HAS_TORCH:
                 inputs_embeds = self.embed_tokens(input_ids)
             self.prefill_calls += int(past_key_values is None)
             hidden = inputs_embeds
-            vision_signal = (
-                0.0
-                if cross_attention_states is None
-                else cross_attention_states.mean().to(hidden)
-            )
+            if cross_attention_states is not None:
+                vision_signal = cross_attention_states.mean().to(hidden)
+                if past_key_values is not None:
+                    past_key_values.vision_signal = vision_signal
+            elif getattr(past_key_values, "vision_signal", None) is not None:
+                # No new frame: read the cached vision K/V, exactly as mllama
+                # does when `cross_attention_states` is None mid-stream.
+                vision_signal = past_key_values.vision_signal
+            else:
+                vision_signal = 0.0
             for layer in self.layers:
                 if isinstance(layer, MossVLCrossAttentionDecoderLayer):
                     hidden = hidden + vision_signal
@@ -358,12 +396,9 @@ class ModelContractTests(unittest.TestCase):
             moss_hidden_size=16,
             state_dim=2,
             action_dim=3,
-            horizon=5,
+            chunk_size=4,
             action_hidden_size=16,
-            flow_layers=2,
-            flow_heads=4,
-            initial_action_noise=0.1,
-            stabilization=2.0,
+            control_interval=0.1,
         )
         return MossActionVLA(TruncatedMossBackbone(FakeMossCore(16)), config)
 
@@ -372,6 +407,12 @@ class ModelContractTests(unittest.TestCase):
             "inputs_embeds": torch.randn(2, 7, 16),
             "attention_mask": torch.ones(2, 7, dtype=torch.bool),
         }
+
+    def _readouts(self) -> torch.Tensor:
+        readouts = torch.zeros(2, 7, dtype=torch.bool)
+        readouts[0, 5] = True
+        readouts[1, 4] = True
+        return readouts
 
     def test_layer_identity_is_exact(self) -> None:
         validate_layer_identity(FakeMossCore(16))
@@ -390,153 +431,169 @@ class ModelContractTests(unittest.TestCase):
         taps = backbone(**self._inputs())
         self.assertEqual(taps.hidden[-1].shape, (2, 7, 16))
 
-    def test_action_path_has_shapes_loss_and_cross_attention_gradient(self) -> None:
+    def test_chunk_loss_shapes_and_cross_attention_gradient(self) -> None:
         policy = self._policy()
         self.assertTrue(all(parameter.requires_grad for parameter in policy.parameters()))
         output = policy(
             self._inputs(),
             torch.randn(2, 2),
-            torch.randn(2, 5, 3),
-            torch.ones(2, 5, dtype=torch.bool),
-            flow_centers=torch.zeros(2, 3),
-            flow_times=torch.zeros(2),
+            torch.randn(2, 2),
+            torch.randn(2, 4, 3),
+            torch.zeros(2),
+            valid_mask=torch.ones(2, 4, dtype=torch.bool),
         )
-        self.assertEqual(output["memory"].shape, (2, 3, 16))
+        self.assertEqual(output["predicted_actions"].shape, (2, 4, 3))
         self.assertTrue(torch.isfinite(output["loss"]))
         output["loss"].backward()
-        gradient = policy.flow.memory_projections[0].weight.grad
+        gradient = policy.decoder.condition_in.weight.grad
         self.assertIsNotNone(gradient)
         self.assertGreater(float(gradient.abs().sum()), 0.0)
         backbone_gradient = policy.backbone.layers[14].cross_attn.q_proj.weight.grad
         self.assertIsNotNone(backbone_gradient)
         self.assertGreater(float(backbone_gradient.abs().sum()), 0.0)
 
-    def test_every_frame_end_receives_an_action_target(self) -> None:
+    def test_training_requires_exactly_one_planning_time_per_sample(self) -> None:
         policy = self._policy()
-        readouts = torch.zeros(2, 7, dtype=torch.bool)
-        readouts[0, [2, 5]] = True
-        readouts[1, 4] = True
-        output = policy(
-            self._inputs(),
-            torch.randn(3, 2),
-            torch.randn(3, 5, 3),
-            torch.ones(3, 5, dtype=torch.bool),
-            flow_centers=torch.zeros(3, 3),
-            flow_times=torch.zeros(3),
-            action_token_mask=readouts,
-        )
-        self.assertEqual(output["memory"].shape, (3, 3, 16))
-        self.assertTrue(torch.isfinite(output["loss"]))
+        two_readouts = torch.zeros(2, 7, dtype=torch.bool)
+        two_readouts[0, [2, 5]] = True
+        two_readouts[1, 4] = True
+        with self.assertRaises(ValueError):
+            policy(
+                self._inputs(),
+                torch.randn(2, 2),
+                torch.randn(2, 2),
+                torch.randn(2, 4, 3),
+                torch.zeros(2),
+                action_token_mask=two_readouts,
+            )
 
-    def test_streaming_flow_emits_one_persistent_action_per_tick(self) -> None:
-        torch.manual_seed(3)
+    def test_valid_mask_excludes_padded_tail_actions(self) -> None:
         policy = self._policy().eval()
-        state = torch.randn(2, 2)
-        memory = policy.encode_memory(self._inputs())
-        first, flow_state = policy.stream_action(
-            memory,
-            state,
-            reference_action=torch.zeros(2, 3),
-            noise=torch.zeros(2, 3),
-        )
-        second, flow_state = policy.stream_action(memory, state, state=flow_state)
-        self.assertEqual(first.shape, (2, 3))
-        self.assertEqual(second.shape, (2, 3))
-        self.assertEqual(flow_state.step, 2)
-
-    def test_streaming_flow_target_stabilizes_around_demo_trajectory(self) -> None:
-        policy = self._policy().eval()
-        actions = torch.full((2, 5, 3), 0.25)
-        _, details = policy.flow.loss(
+        inputs = self._inputs()
+        actions = torch.zeros(2, 4, 3)
+        mask = torch.zeros(2, 4, dtype=torch.bool)
+        mask[:, :2] = True
+        torch.manual_seed(0)
+        masked = policy(
+            inputs,
+            torch.zeros(2, 2),
+            torch.zeros(2, 2),
             actions,
-            policy.encode_memory(self._inputs()),
+            torch.zeros(2),
+            valid_mask=mask,
+            action_token_mask=self._readouts(),
+        )
+        # Padding the tail with a wildly different value must not move the loss.
+        actions[:, 2:] = 99.0
+        torch.manual_seed(0)
+        padded = policy(
+            inputs,
             torch.zeros(2, 2),
-            torch.ones(2, 5, dtype=torch.bool),
-            flow_centers=torch.full((2, 3), 0.25),
-            noise=torch.ones(2, 3),
-            times=torch.zeros(2),
-        )
-        torch.testing.assert_close(
-            details["trajectory_actions"], torch.full((2, 3), 0.25)
-        )
-        torch.testing.assert_close(
-            details["sampled_actions"], torch.full((2, 3), 0.35)
-        )
-        torch.testing.assert_close(
-            details["target_velocity"], torch.full((2, 3), -0.2)
-        )
-        ramp = (
-            torch.arange(1, 6, dtype=torch.float32)[None, :, None]
-            .expand(2, -1, 3)
-            / 10
-        )
-        _, ramp_details = policy.flow.loss(
-            ramp,
-            policy.encode_memory(self._inputs()),
             torch.zeros(2, 2),
-            flow_centers=torch.zeros(2, 3),
-            noise=torch.zeros(2, 3),
-            times=torch.full((2,), 0.5),
+            actions,
+            torch.zeros(2),
+            valid_mask=mask,
+            action_token_mask=self._readouts(),
+        )
+        torch.testing.assert_close(masked["loss"], padded["loss"])
+
+    def test_query_delays_advance_by_one_control_interval(self) -> None:
+        policy = self._policy()
+        delays = policy.default_query_delays(
+            torch.tensor([0.2, 0.0]), inference_latency=0.05
         )
         torch.testing.assert_close(
-            ramp_details["target_velocity"], torch.full((2, 3), 0.4)
+            delays,
+            torch.tensor(
+                [[0.25, 0.35, 0.45, 0.55], [0.05, 0.15, 0.25, 0.35]]
+            ),
         )
 
-    def test_streaming_flow_cycle_restarts_from_last_action(self) -> None:
+    def test_visual_age_changes_the_predicted_chunk(self) -> None:
+        torch.manual_seed(11)
         policy = self._policy().eval()
-        memory = policy.encode_memory(self._inputs())
-        previous = torch.full((2, 3), 0.2)
-        from model import StreamingActionState
-
-        _, state = policy.stream_action(
-            memory,
-            torch.zeros(2, 2),
-            state=StreamingActionState(previous, policy.config.horizon - 1),
-            noise=torch.zeros(2, 3),
+        inputs = self._inputs()
+        fresh = policy.predict_chunk(
+            inputs, torch.zeros(2, 2), torch.zeros(2, 2), torch.zeros(2)
         )
-        self.assertEqual(state.step, 1)
+        stale = policy.predict_chunk(
+            inputs, torch.zeros(2, 2), torch.zeros(2, 2), torch.full((2,), 0.5)
+        )
+        self.assertFalse(torch.allclose(fresh, stale))
 
-    def test_stream_appends_only_new_frames_and_updates_action_memory(self) -> None:
+    def test_action_queries_leave_the_streaming_cache_untouched(self) -> None:
+        """The core ephemeral invariant: a plan must never enter the prefix."""
+        policy = self._policy().eval()
+        session = policy.create_stream(FakeProcessor(), "pick up the cube")
+        session.append_frame(np.zeros((2, 2, 3), dtype=np.uint8), timestamp=0.0)
+        cache = session.state.past_key_values
+        before = [layer.get_seq_length() for layer in cache.layers]
+        tokens_before = session.state.input_ids.shape[1]
+        frames_before = session.state.frame_count
+        vision_before = session.state.vision_tokens
+        position_before = session.state.next_text_position
+
+        chunk = session.plan(torch.zeros(1, 2), torch.zeros(1, 2), plan_timestamp=0.05)
+
+        self.assertEqual(chunk.actions.shape, (4, 3))
+        self.assertEqual(
+            [layer.get_seq_length() for layer in cache.layers], before
+        )
+        self.assertEqual(session.state.input_ids.shape[1], tokens_before)
+        self.assertEqual(session.state.frame_count, frames_before)
+        self.assertEqual(session.state.vision_tokens, vision_before)
+        self.assertEqual(session.state.next_text_position, position_before)
+
+    def test_repeated_planning_is_stationary(self) -> None:
+        """Planning twice without a new frame must give the same chunk."""
+        policy = self._policy().eval()
+        session = policy.create_stream(FakeProcessor(), "pick up the cube")
+        session.append_frame(np.zeros((2, 2, 3), dtype=np.uint8), timestamp=0.0)
+        first = session.plan(torch.zeros(1, 2), torch.zeros(1, 2), plan_timestamp=0.05)
+        second = session.plan(torch.zeros(1, 2), torch.zeros(1, 2), plan_timestamp=0.05)
+        torch.testing.assert_close(first.actions, second.actions)
+        self.assertAlmostEqual(first.visual_age, 0.05, places=6)
+
+    def test_stream_appends_only_new_frames_and_tracks_visual_age(self) -> None:
         torch.manual_seed(7)
         policy = self._policy().eval()
         session = policy.create_stream(FakeProcessor(), "pick up the cube")
         state = torch.zeros(1, 2)
-        noise = torch.randn(1, 5, 3)
-        first, action_state = session.predict_action(
-            np.zeros((2, 2, 3), dtype=np.uint8),
-            state,
-            timestamp=10.0,
-            reference_action=torch.zeros(1, 3),
-            noise=noise[:, 0],
+        first = session.predict_chunk(
+            np.zeros((2, 2, 3), dtype=np.uint8), state, state, timestamp=10.0
         )
-        second, _ = session.predict_action(
-            np.full((2, 2, 3), 255, dtype=np.uint8),
-            state,
-            timestamp=10.1,
-            action_state=action_state,
+        second = session.predict_chunk(
+            np.full((2, 2, 3), 255, dtype=np.uint8), state, state, timestamp=10.1
         )
         self.assertEqual(policy.backbone.moss.language_model.prefill_calls, 1)
         self.assertEqual(policy.backbone.moss.vision_calls, 2)
         self.assertEqual(session.state.frame_count, 2)
         self.assertEqual(session.state.vision_tokens, 10)
         self.assertEqual(session.state.past_key_values.get_seq_length(2), 13)
-        self.assertFalse(torch.allclose(first, second))
+        self.assertIsInstance(first, ActionChunk)
+        self.assertFalse(torch.allclose(first.actions, second.actions))
 
-    def test_incremental_stream_memory_trains_the_action_projection(self) -> None:
+    def test_action_queries_read_the_cached_vision(self) -> None:
+        """Queries carry no new frame, so they must attend to the cached K/V."""
+        policy = self._policy().eval()
+        chunks = []
+        for value in (0, 255):
+            session = policy.create_stream(FakeProcessor(), "pick up the cube")
+            session.append_frame(
+                np.full((2, 2, 3), value, dtype=np.uint8), timestamp=0.0
+            )
+            chunks.append(
+                session.plan(
+                    torch.zeros(1, 2), torch.zeros(1, 2), plan_timestamp=0.0
+                ).actions
+            )
+        self.assertFalse(torch.allclose(chunks[0], chunks[1]))
+
+    def test_planning_requires_a_frame_first(self) -> None:
         policy = self._policy().eval()
         session = policy.create_stream(FakeProcessor(), "pick up the cube")
-        memories = [
-            session.encode_frame(
-                np.full((2, 2, 3), value, dtype=np.uint8),
-                timestamp=0.1 * index,
-            )
-            for index, value in enumerate((0, 255))
-        ]
-        torch.cat(memories).sum().backward()
-        gradient = policy.flow.memory_projections[0].weight.grad
-        self.assertIsNotNone(gradient)
-        self.assertEqual(session.state.frame_count, 2)
-        self.assertEqual(policy.backbone.moss.vision_calls, 2)
+        with self.assertRaises(RuntimeError):
+            session.plan(torch.zeros(1, 2), torch.zeros(1, 2), plan_timestamp=0.0)
 
     def test_realtime_mrope_reserves_the_visual_grid(self) -> None:
         input_ids = torch.tensor([[5, 99, 6]])
@@ -568,73 +625,125 @@ class ModelContractTests(unittest.TestCase):
     HAS_TORCH and globals().get("HAS_H5PY", False), "torch/h5py unavailable"
 )
 class DataContractTests(unittest.TestCase):
-    def test_hdf5_alignment_upright_image_and_masked_tail(self) -> None:
+    def _write(self, path: Path, steps: int = 6) -> tuple[np.ndarray, np.ndarray]:
+        with h5py.File(path, "w") as handle:
+            data = handle.create_group("data")
+            data.attrs["problem_info"] = json.dumps(
+                {"language_instruction": "pick up the cube"}
+            )
+            demo = data.create_group("demo_0")
+            actions = np.linspace(-1.0, 1.0, steps * 7, dtype=np.float32).reshape(
+                steps, 7
+            )
+            demo.create_dataset("actions", data=actions)
+            observations = demo.create_group("obs")
+            frames = np.arange(steps * 2 * 3 * 3, dtype=np.uint8).reshape(
+                steps, 2, 3, 3
+            )
+            observations.create_dataset("agentview_rgb", data=frames)
+            rows = np.arange(steps, dtype=np.float32)[:, None]
+            observations.create_dataset(
+                "joint_states", data=rows + np.arange(7, dtype=np.float32)[None] / 10
+            )
+            observations.create_dataset(
+                "gripper_states", data=rows + np.arange(2, dtype=np.float32)[None] / 10
+            )
+        return actions, frames
+
+    def test_each_sample_is_one_planning_time(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "task.hdf5"
-            with h5py.File(path, "w") as handle:
-                data = handle.create_group("data")
-                data.attrs["problem_info"] = json.dumps(
-                    {"language_instruction": "pick up the cube"}
-                )
-                demo = data.create_group("demo_0")
-                actions = np.linspace(-1.0, 1.0, 28, dtype=np.float32).reshape(4, 7)
-                demo.create_dataset("actions", data=actions)
-                observations = demo.create_group("obs")
-                frames = np.arange(4 * 2 * 3 * 3, dtype=np.uint8).reshape(4, 2, 3, 3)
-                observations.create_dataset("agentview_rgb", data=frames)
-                rows = np.arange(4, dtype=np.float32)[:, None]
-                observations.create_dataset(
-                    "joint_states",
-                    data=rows + np.arange(7, dtype=np.float32)[None] / 10,
-                )
-                observations.create_dataset(
-                    "gripper_states",
-                    data=rows + np.arange(2, dtype=np.float32)[None] / 10,
-                )
-
-            dataset = LiberoHDF5Dataset(path, horizon=3, action_offset=1)
-            self.assertEqual(len(dataset), 1)
-            first = dataset[0]
-            self.assertEqual(len(first["images"]), 3)
-            np.testing.assert_array_equal(
-                np.asarray(first["images"][0]), frames[0, ::-1]
-            )
-            np.testing.assert_allclose(first["actions"][0], actions[1:4])
-            np.testing.assert_allclose(first["flow_centers"][0], actions[0])
-            self.assertEqual(float(first["flow_times"][0]), 0.0)
-            self.assertEqual(float(first["flow_times"][1]), 0.5)
-            np.testing.assert_array_equal(
-                first["action_valid_mask"][0], [True, True, True]
-            )
-            np.testing.assert_allclose(
-                first["actions"][2], np.repeat(actions[3:4], 3, axis=0)
-            )
-            np.testing.assert_array_equal(
-                first["action_valid_mask"][2], [True, False, False]
-            )
-            self.assertEqual(first["instruction"], "pick up the cube")
-
-            windowed = LiberoHDF5Dataset(
+            actions, frames = self._write(path)
+            dataset = LiberoHDF5Dataset(
                 path,
-                horizon=2,
-                action_offset=0,
-                frame_stride=1,
-                frame_interval=0.05,
+                chunk_size=3,
+                action_offset=1,
+                context_frames=2,
+                max_visual_age_steps=0,
             )
-            self.assertEqual(len(windowed), 1)
-            row = windowed[0]
-            self.assertEqual(len(row["images"]), 4)
-            for index, image in enumerate(row["images"]):
-                np.testing.assert_array_equal(np.asarray(image), frames[index, ::-1])
-            np.testing.assert_allclose(
-                row["frame_timestamps"], [0.0, 0.05, 0.1, 0.15]
+            # One item per planning time rather than one item per episode.
+            self.assertEqual(len(dataset), 5)
+            first = dataset[0]
+            self.assertEqual(first["planning_time"], 0)
+            self.assertEqual(first["actions"].shape, (3, 7))
+            np.testing.assert_allclose(first["actions"], actions[1:4])
+            np.testing.assert_array_equal(
+                first["action_valid_mask"], [True, True, True]
             )
-            np.testing.assert_allclose(row["actions"][:, 0], actions)
+            self.assertEqual(first["robot_state"].shape, (9,))
+            self.assertEqual(first["state_difference"].shape, (9,))
+            np.testing.assert_array_equal(
+                np.asarray(first["images"][-1]), frames[0, ::-1]
+            )
+            # A later planning time sees more context and a moving state.
+            third = dataset[3]
+            self.assertEqual(third["planning_time"], 3)
+            self.assertEqual(len(third["images"]), 2)
+            np.testing.assert_array_equal(
+                np.asarray(third["images"][-1]), frames[3, ::-1]
+            )
+            self.assertGreater(float(np.abs(third["state_difference"]).max()), 0.0)
 
-            batch = MossActionCollator(FakeProcessor())([windowed[0]])
-            self.assertEqual(batch["action_token_mask"].sum().item(), 4)
-            self.assertEqual(batch["robot_state"].shape, (4, 9))
-            self.assertEqual(batch["actions"].shape, (4, 2, 7))
+    def test_action_chunk_pads_and_masks_the_episode_tail(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "task.hdf5"
+            actions, _ = self._write(path)
+            dataset = LiberoHDF5Dataset(
+                path, chunk_size=3, action_offset=1, max_visual_age_steps=0
+            )
+            last = dataset[len(dataset) - 1]
+            self.assertEqual(last["planning_time"], 4)
+            np.testing.assert_allclose(last["actions"][0], actions[5])
+            np.testing.assert_allclose(last["actions"][1], actions[5])
+            np.testing.assert_array_equal(
+                last["action_valid_mask"], [True, False, False]
+            )
+
+    def test_delay_aware_sampling_cuts_the_prefix_before_the_planning_time(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "task.hdf5"
+            _, frames = self._write(path)
+            fresh = LiberoHDF5Dataset(
+                path, chunk_size=2, context_frames=2, max_visual_age_steps=0
+            )
+            self.assertEqual(float(fresh[4]["visual_age"]), 0.0)
+            np.testing.assert_array_equal(
+                np.asarray(fresh[4]["images"][-1]), frames[4, ::-1]
+            )
+            stale = LiberoHDF5Dataset(
+                path, chunk_size=2, context_frames=2, max_visual_age_steps=2, seed=0
+            )
+            ages = {float(stale[index]["visual_age"]) for index in range(len(stale))}
+            self.assertTrue(ages - {0.0}, "delay-aware training produced no staleness")
+            for index in range(len(stale)):
+                row = stale[index]
+                steps_late = round(float(row["visual_age"]) / 0.1)
+                newest = max(0, row["planning_time"] - steps_late)
+                np.testing.assert_array_equal(
+                    np.asarray(row["images"][-1]), frames[newest, ::-1]
+                )
+                # Actions always start at the planning time, never at the frame.
+                np.testing.assert_allclose(
+                    row["query_delays"][0], row["visual_age"], atol=1e-6
+                )
+
+    def test_collator_emits_exactly_one_readout_per_sample(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "task.hdf5"
+            self._write(path)
+            dataset = LiberoHDF5Dataset(
+                path, chunk_size=3, context_frames=2, max_visual_age_steps=0
+            )
+            batch = MossActionCollator(FakeProcessor())([dataset[2], dataset[3]])
+            mask = batch["action_token_mask"]
+            np.testing.assert_array_equal(mask.sum(dim=1).numpy(), [1, 1])
+            self.assertEqual(batch["robot_state"].shape, (2, 9))
+            self.assertEqual(batch["state_difference"].shape, (2, 9))
+            self.assertEqual(batch["actions"].shape, (2, 3, 7))
+            self.assertEqual(batch["query_delays"].shape, (2, 3))
+            self.assertEqual(batch["visual_age"].shape, (2,))
 
 
 def _capture_raw_taps(

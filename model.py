@@ -1,4 +1,11 @@
-"""Truncated MOSS-VL backbone and the MOSS-Action policy."""
+"""Truncated MOSS-VL backbone and the MOSS-Action policy.
+
+The policy keeps an append-only streaming visual KV cache and decodes a short
+continuous action chunk from a handful of *ephemeral* action queries. The
+queries live only for the duration of one planning call: their key/value entries
+are cropped out of the cache immediately afterwards, so a later frame can never
+attend to a plan that was never executed.
+"""
 
 from __future__ import annotations
 
@@ -7,8 +14,8 @@ import hashlib
 import math
 import re
 import time
-from collections.abc import Mapping, Sequence
-from contextlib import nullcontext
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager, nullcontext
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -19,6 +26,7 @@ from torch.nn import functional as F
 
 RETAINED_LAYERS = 24
 RETAINED_CROSS_ATTENTION_LAYERS = (2, 6, 10, 14, 18, 22)
+# Only used by the offline parity CLI; the policy reads the final hidden state.
 TAP_LAYERS = (14, 18, 23)
 
 
@@ -27,41 +35,38 @@ class MossActionConfig:
     moss_hidden_size: int = 4096
     state_dim: int = 9
     action_dim: int = 7
-    horizon: int = 50
+    chunk_size: int = 8
     action_hidden_size: int = 1024
-    flow_layers: int = 6
-    flow_heads: int = 16
-    dropout: float = 0.0
-    initial_action_noise: float = 0.1
-    stabilization: float = 10.0
+    control_interval: float = 0.1
+    delay_scale: float = 1.0
 
     def __post_init__(self) -> None:
         positive = (
             self.moss_hidden_size,
             self.state_dim,
             self.action_dim,
-            self.horizon,
+            self.chunk_size,
             self.action_hidden_size,
-            self.flow_layers,
-            self.flow_heads,
         )
         if any(value < 1 for value in positive):
-            raise ValueError(
-                "all dimensions and layer counts must be positive"
-            )
-        if self.action_hidden_size % self.flow_heads:
-            raise ValueError("action_hidden_size must be divisible by flow_heads")
-        if not 0.0 <= self.dropout < 1.0:
-            raise ValueError("dropout must be in [0, 1)")
-        if self.horizon < 2:
-            raise ValueError("streaming action flow needs a horizon of at least two")
-        if self.initial_action_noise <= 0 or self.stabilization <= 0:
-            raise ValueError("streaming flow noise and stabilization must be positive")
+            raise ValueError("all dimensions and counts must be positive")
+        if self.control_interval <= 0 or self.delay_scale <= 0:
+            raise ValueError("control_interval and delay_scale must be positive")
+
+    @property
+    def condition_dim(self) -> int:
+        """Robot state, its one-step difference, and the newest frame's age."""
+        return 2 * self.state_dim + 1
+
+    @property
+    def micro_horizon(self) -> float:
+        """Physical seconds covered by one chunk at the training control rate."""
+        return self.chunk_size * self.control_interval
 
 
 @dataclass(frozen=True)
 class BackboneTaps:
-    hidden: tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+    hidden: tuple[torch.Tensor, ...]
     text_mask: torch.Tensor
 
 
@@ -78,12 +83,15 @@ class MossStreamState:
     frame_count: int = 0
 
 
-@dataclass
-class StreamingActionState:
-    """Persistent action-space flow state advanced once per control tick."""
+@dataclass(frozen=True)
+class ActionChunk:
+    """One plan: `actions[j]` is meant to execute at `start_time + j * interval`."""
 
-    action: torch.Tensor
-    step: int = 0
+    actions: torch.Tensor
+    start_time: float
+    plan_time: float
+    interval: float
+    visual_age: float
 
 
 @dataclass(frozen=True)
@@ -447,6 +455,112 @@ class TruncatedMossBackbone(nn.Module):
             torch.ones(1, 1, dtype=torch.bool, device=input_ids.device),
         )
 
+    @contextmanager
+    def _ephemeral_cache(self, state: MossStreamState) -> Iterator[None]:
+        """Restore every self-attention cache length after a throwaway branch.
+
+        Cross-attention layers hold vision keys rather than text keys, so their
+        length is governed by `state.vision_tokens` and must be left alone; the
+        action branch carries no new frame.
+        """
+        cache_layers = getattr(state.past_key_values, "layers", ())
+        committed = {
+            index: layer.get_seq_length()
+            for index, layer in enumerate(cache_layers)
+            if index not in RETAINED_CROSS_ATTENTION_LAYERS
+        }
+        try:
+            yield
+        finally:
+            for index, length in committed.items():
+                layer = cache_layers[index]
+                if layer.get_seq_length() > length:
+                    layer.crop(length)
+                if layer.get_seq_length() != length:
+                    raise RuntimeError(
+                        "ephemeral action queries corrupted the streaming cache: "
+                        f"layer {index} is {layer.get_seq_length()}, expected {length}"
+                    )
+
+    @torch.no_grad()
+    def decode_action_queries(
+        self, state: MossStreamState, query_embeds: torch.Tensor
+    ) -> torch.Tensor:
+        """Run action queries against the committed prefix, then drop their KV.
+
+        The persistent stream is left byte-identical: no new frame is appended,
+        `input_ids` / `attention_mask` / vision bookkeeping are untouched, and
+        the queries' key-value entries are cropped on the way out.
+        """
+        if query_embeds.ndim != 3 or query_embeds.shape[0] != 1:
+            raise ValueError("action queries must have shape [1, chunk, hidden]")
+        queries = query_embeds.shape[1]
+        if queries < 1:
+            raise ValueError("a planning call needs at least one action query")
+        prefix_tokens = state.input_ids.shape[1]
+        cache_position = torch.arange(
+            prefix_tokens,
+            prefix_tokens + queries,
+            device=query_embeds.device,
+        )
+        # Queries share one XRoPE slot so their order is carried by the learned
+        # per-slot embedding rather than by position, and so the committed
+        # prefix keeps the exact positions a later frame will continue from.
+        position_ids = torch.full(
+            (3, 1, queries),
+            state.next_text_position,
+            dtype=torch.long,
+            device=query_embeds.device,
+        )
+        attention_mask = torch.cat(
+            (
+                state.attention_mask,
+                torch.ones(
+                    1, queries, dtype=state.attention_mask.dtype, device=query_embeds.device
+                ),
+            ),
+            dim=1,
+        )
+        # Cross-attention layers reuse the cached vision keys, but the cache also
+        # holds padding slots. Every frame so far is visible to every query; the
+        # expansion below is what masks the padding tail.
+        cross_attention_mask = None
+        full_text_row_masked_out_mask = None
+        if state.full_vision_token_info is not None and state.frame_count:
+            visible = torch.zeros(
+                1,
+                1,
+                queries,
+                state.frame_count,
+                dtype=torch.bool,
+                device=query_embeds.device,
+            )
+            cross_attention_mask = self.moss._expand_cross_attention_mask(
+                visible,
+                state.full_vision_token_info,
+                target_dtype=query_embeds.dtype,
+            )
+            minimum = torch.finfo(cross_attention_mask.dtype).min
+            full_text_row_masked_out_mask = (
+                (cross_attention_mask != minimum)
+                .any(dim=-1)
+                .to(cross_attention_mask.dtype)[..., None]
+            )
+            cross_attention_mask = cross_attention_mask * full_text_row_masked_out_mask
+        with self._ephemeral_cache(state):
+            output = self.moss.language_model(
+                input_ids=None,
+                inputs_embeds=query_embeds,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=state.past_key_values,
+                cross_attention_mask=cross_attention_mask,
+                full_text_row_masked_out_mask=full_text_row_masked_out_mask,
+                cache_position=cache_position,
+                use_cache=True,
+            )
+        return _layer_tensor(output)
+
 
 def _time_embedding(times: torch.Tensor, width: int) -> torch.Tensor:
     half = width // 2
@@ -462,64 +576,150 @@ def _time_embedding(times: torch.Tensor, width: int) -> torch.Tensor:
     return embedding.to(dtype=times.dtype)
 
 
-class StreamingFlowActionExpert(nn.Module):
-    """Action-space flow whose integration time is robot execution time."""
+class ActionQueryDecoder(nn.Module):
+    """Builds ephemeral action-query embeddings and reads their hidden states.
+
+    Fusion with vision and language happens inside MOSS, so the readout is a
+    plain MLP. Each query carries its own predicted execution delay, because the
+    j-th action of a chunk executes one control period later than the (j-1)-th
+    and therefore acts on visual evidence that is correspondingly staler.
+    """
 
     def __init__(self, config: MossActionConfig):
         super().__init__()
-        width = config.action_hidden_size
+        width = config.moss_hidden_size
         self.state_dim = config.state_dim
         self.action_dim = config.action_dim
-        self.horizon = config.horizon
-        self.initial_action_noise = config.initial_action_noise
-        self.stabilization = config.stabilization
-        self.memory_norms = nn.ModuleList(
-            nn.RMSNorm(config.moss_hidden_size) for _ in TAP_LAYERS
-        )
-        self.memory_projections = nn.ModuleList(
-            nn.Linear(config.moss_hidden_size, width, bias=False) for _ in TAP_LAYERS
-        )
-        self.action_in = nn.Linear(config.action_dim, width)
-        self.state_in = nn.Linear(config.state_dim, width)
-        self.action_query = nn.Parameter(torch.empty(width))
-        self.time_in = nn.Sequential(
+        self.chunk_size = config.chunk_size
+        self.delay_scale = config.delay_scale
+        self.condition_in = nn.Linear(config.condition_dim, width)
+        self.query_embedding = nn.Parameter(torch.empty(config.chunk_size, width))
+        self.delay_in = nn.Sequential(
             nn.Linear(width, width), nn.SiLU(), nn.Linear(width, width)
         )
-        layer = nn.TransformerDecoderLayer(
-            d_model=width,
-            nhead=config.flow_heads,
-            dim_feedforward=4 * width,
-            dropout=config.dropout,
-            activation="gelu",
-            batch_first=True,
-            norm_first=True,
+        self.head = nn.Sequential(
+            nn.RMSNorm(width),
+            nn.Linear(width, config.action_hidden_size),
+            nn.SiLU(),
+            nn.Linear(config.action_hidden_size, config.action_dim),
         )
-        self.transformer = nn.TransformerDecoder(
-            layer, config.flow_layers, nn.RMSNorm(width)
-        )
-        self.action_out = nn.Linear(width, config.action_dim)
-        nn.init.normal_(self.action_query, std=0.02)
+        nn.init.normal_(self.query_embedding, std=0.02)
+        # A small but nonzero output layer: zero-init would stall the first step
+        # by zeroing the gradient of everything upstream of the head.
+        nn.init.normal_(self.head[-1].weight, std=1e-3)
+        nn.init.zeros_(self.head[-1].bias)
 
-    def encode_memory(
+    def condition(
         self,
-        taps: Sequence[torch.Tensor],
-        text_mask: torch.Tensor,
-        readout_mask: torch.Tensor | None = None,
+        robot_state: torch.Tensor,
+        state_difference: torch.Tensor,
+        visual_age: torch.Tensor,
     ) -> torch.Tensor:
-        if len(taps) != len(self.memory_projections):
+        batch = robot_state.shape[0]
+        if robot_state.shape != (batch, self.state_dim):
+            raise ValueError(f"robot_state must have shape [batch, {self.state_dim}]")
+        if state_difference.shape != robot_state.shape:
+            raise ValueError("state_difference must align with robot_state")
+        if visual_age.ndim == 0:
+            visual_age = visual_age.expand(batch)
+        if visual_age.shape != (batch,):
+            raise ValueError("visual_age must be scalar or shape [batch]")
+        return torch.cat(
+            (
+                robot_state,
+                state_difference,
+                visual_age.unsqueeze(-1).to(robot_state) * self.delay_scale,
+            ),
+            dim=-1,
+        )
+
+    def query_embeddings(
+        self,
+        condition: torch.Tensor,
+        query_delays: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return `[batch, chunk_size, moss_hidden]` ephemeral query inputs."""
+        batch = condition.shape[0]
+        if query_delays.shape != (batch, self.chunk_size):
             raise ValueError(
-                f"expected {len(self.memory_projections)} hidden taps, got {len(taps)}"
+                f"query_delays must have shape [batch, {self.chunk_size}]"
             )
-        if text_mask.ndim != 2 or not bool(text_mask.any(dim=1).all()):
-            raise ValueError("text_mask must contain one valid token per sample")
-        selected = None
-        if readout_mask is not None:
-            if readout_mask.shape != text_mask.shape:
-                raise ValueError("readout_mask must align with MOSS text tokens")
-            selected = readout_mask.to(device=text_mask.device, dtype=torch.bool)
-            selected &= text_mask.bool()
-            if not bool(selected.any(dim=1).all()):
-                raise ValueError("readout_mask must select a token from every sample")
+        hidden = self.query_embedding[None].expand(batch, -1, -1)
+        hidden = hidden + self.condition_in(condition).unsqueeze(1)
+        delays = (query_delays.to(condition) * self.delay_scale).reshape(-1)
+        delay_embedding = self.delay_in(
+            _time_embedding(delays, hidden.shape[-1])
+        ).view(batch, self.chunk_size, -1)
+        return hidden + delay_embedding
+
+    def forward(self, action_hidden: torch.Tensor) -> torch.Tensor:
+        if action_hidden.ndim != 3 or action_hidden.shape[1] != self.chunk_size:
+            raise ValueError(
+                f"action hidden states must have shape [batch, {self.chunk_size}, hidden]"
+            )
+        return self.head(action_hidden)
+
+
+class MossActionVLA(nn.Module):
+    """Streaming visual context, ephemeral action queries, continuous chunk."""
+
+    def __init__(self, backbone: TruncatedMossBackbone, config: MossActionConfig):
+        super().__init__()
+        self.config = config
+        self.backbone = backbone
+        self.decoder = ActionQueryDecoder(config)
+
+    def default_query_delays(
+        self,
+        visual_age: torch.Tensor,
+        *,
+        inference_latency: torch.Tensor | float = 0.0,
+    ) -> torch.Tensor:
+        """d_j = visual_age + inference_latency + j * control_interval."""
+        batch = visual_age.shape[0]
+        offsets = torch.arange(
+            self.config.chunk_size, device=visual_age.device, dtype=visual_age.dtype
+        )
+        latency = (
+            inference_latency
+            if isinstance(inference_latency, torch.Tensor)
+            else torch.full_like(visual_age, float(inference_latency))
+        )
+        if latency.shape != (batch,):
+            raise ValueError("inference_latency must be scalar or shape [batch]")
+        base = visual_age + latency
+        return base[:, None] + offsets[None] * self.config.control_interval
+
+    def predict_chunk(
+        self,
+        moss_inputs: Mapping[str, Any],
+        robot_state: torch.Tensor,
+        state_difference: torch.Tensor,
+        visual_age: torch.Tensor,
+        *,
+        query_delays: torch.Tensor | None = None,
+        action_token_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Full-recompute path: one planning time per sample."""
+        needs_backbone_grad = any(
+            parameter.requires_grad for parameter in self.backbone.parameters()
+        )
+        with nullcontext() if needs_backbone_grad else torch.no_grad():
+            taps = self.backbone(**dict(moss_inputs))
+        hidden, text_mask = taps.hidden[-1], taps.text_mask
+        if action_token_mask is not None:
+            if action_token_mask.shape != text_mask.shape:
+                raise ValueError("action_token_mask must align with MOSS text tokens")
+            selected = action_token_mask.to(
+                device=text_mask.device, dtype=torch.bool
+            ) & text_mask.bool()
+            counts = selected.sum(dim=1)
+            if not bool((counts == 1).all()):
+                raise ValueError(
+                    "single-planning-time training needs exactly one readout token "
+                    f"per sample, got {counts.tolist()}"
+                )
+            prefix = hidden[selected]
         else:
             positions = torch.arange(text_mask.shape[1], device=text_mask.device)
             last = (
@@ -528,222 +728,57 @@ class StreamingFlowActionExpert(nn.Module):
                 .max(1)
                 .values
             )
-            batch = torch.arange(text_mask.shape[0], device=text_mask.device)
-        memories = []
-        for hidden, norm, projection in zip(
-            taps, self.memory_norms, self.memory_projections
-        ):
-            if hidden.shape[:2] != text_mask.shape:
-                raise ValueError("every MOSS tap must align with text_mask")
-            readout = hidden[selected] if selected is not None else hidden[batch, last]
-            memories.append(projection(norm(readout)))
-        return torch.stack(memories, dim=1)
-
-    def forward(
-        self,
-        action: torch.Tensor,
-        times: torch.Tensor,
-        memory: torch.Tensor,
-        robot_state: torch.Tensor,
-    ) -> torch.Tensor:
-        if action.ndim != 2 or action.shape[1] != self.action_dim:
-            raise ValueError(f"action must have shape [batch, {self.action_dim}]")
-        if memory.ndim != 3 or memory.shape[0] != action.shape[0]:
-            raise ValueError("memory must have shape [batch, memory_tokens, hidden]")
-        if robot_state.shape != (action.shape[0], self.state_dim):
-            raise ValueError(
-                f"robot_state must have shape [batch, {self.state_dim}]"
-            )
-        if times.ndim == 0:
-            times = times.expand(action.shape[0])
-        if times.shape != (action.shape[0],):
-            raise ValueError("times must be scalar or shape [batch]")
-        hidden = self.action_in(action).unsqueeze(1) + self.action_query[None, None]
-        hidden = hidden + self.state_in(robot_state.to(hidden)).unsqueeze(1)
-        hidden = hidden + self.time_in(_time_embedding(times, hidden.shape[-1]))[:, None]
-        return self.action_out(self.transformer(hidden, memory))[:, 0]
-
-    def loss(
-        self,
-        actions: torch.Tensor,
-        memory: torch.Tensor,
-        robot_state: torch.Tensor,
-        valid_mask: torch.Tensor | None = None,
-        *,
-        flow_centers: torch.Tensor,
-        times: torch.Tensor,
-        noise: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        if actions.ndim != 3 or actions.shape[1:] != (self.horizon, self.action_dim):
-            raise ValueError(
-                f"actions must have shape [batch, {self.horizon}, {self.action_dim}]"
-            )
-        batch = actions.shape[0]
-        noise = (
-            torch.randn(batch, self.action_dim, device=actions.device, dtype=actions.dtype)
-            if noise is None
-            else noise.to(actions)
+            rows = torch.arange(text_mask.shape[0], device=text_mask.device)
+            prefix = hidden[rows, last]
+        if visual_age.ndim == 0:
+            visual_age = visual_age.expand(prefix.shape[0])
+        if query_delays is None:
+            query_delays = self.default_query_delays(visual_age)
+        condition = self.decoder.condition(
+            robot_state.to(prefix), state_difference.to(prefix), visual_age.to(prefix)
         )
-        if noise.shape != (batch, self.action_dim):
-            raise ValueError("streaming Flow noise must have shape [batch, action_dim]")
-        flow_centers = flow_centers.to(actions)
-        if flow_centers.shape != (batch, self.action_dim):
-            raise ValueError("flow_centers must have shape [batch, action_dim]")
-        times = times.to(device=actions.device, dtype=actions.dtype)
-        if times.shape != (batch,) or not bool(((0 <= times) & (times <= 1)).all()):
-            raise ValueError("Flow times must have shape [batch] and lie in [0,1]")
-        if valid_mask is None:
-            lengths = torch.full(
-                (batch,), self.horizon, device=actions.device, dtype=torch.long
-            )
-        else:
-            if valid_mask.shape != actions.shape[:2]:
-                raise ValueError("valid_mask must align with the demonstration trajectory")
-            valid_mask = valid_mask.to(device=actions.device, dtype=torch.bool)
-            if not bool(valid_mask[:, 0].all()):
-                raise ValueError("every stream frame needs its next action")
-            lengths = valid_mask.sum(dim=1)
-            expected = torch.arange(self.horizon, device=actions.device)[None] < lengths[:, None]
-            if not torch.equal(valid_mask, expected):
-                raise ValueError("valid actions must form a contiguous trajectory prefix")
-
-        # Online term matches the exact persistent state used at deployment.
-        online_trajectory = flow_centers
-        online_derivative = (actions[:, 0] - online_trajectory) * (self.horizon - 1)
-        online_sigma = self.initial_action_noise * torch.exp(
-            -self.stabilization * times
-        )
-        online_actions = online_trajectory + online_sigma[:, None] * noise
-        online_target = online_derivative - self.stabilization * (
-            online_actions - online_trajectory
-        )
-
-        # A second uniform phase supplies the original trajectory-level SFP objective.
-        plan_times = torch.rand_like(times)
-        span = (lengths - 1).clamp_min(0)
-        position = plan_times * span.to(plan_times.dtype)
-        left = position.floor().long()
-        right = torch.minimum(left + 1, lengths - 1)
-        alpha = (position - left).unsqueeze(1)
-        rows = torch.arange(batch, device=actions.device)
-        plan_trajectory = actions[rows, left].lerp(actions[rows, right], alpha)
-        plan_derivative = (actions[rows, right] - actions[rows, left]) * span[:, None]
-        plan_sigma = self.initial_action_noise * torch.exp(
-            -self.stabilization * plan_times
-        )
-        plan_actions = plan_trajectory + plan_sigma[:, None] * noise
-        plan_target = plan_derivative - self.stabilization * (
-            plan_actions - plan_trajectory
-        )
-
-        predicted = self(
-            torch.cat((online_actions, plan_actions)),
-            torch.cat((times, plan_times)),
-            torch.cat((memory, memory)),
-            torch.cat((robot_state, robot_state)),
-        )
-        predicted_velocity, predicted_plan_velocity = predicted.chunk(2)
-        loss = (
-            predicted - torch.cat((online_target, plan_target))
-        ).square().mean()
-        return loss, {
-            "predicted_velocity": predicted_velocity,
-            "target_velocity": online_target,
-            "sampled_actions": online_actions,
-            "trajectory_actions": online_trajectory,
-            "times": times,
-            "planning_velocity": predicted_plan_velocity,
-            "planning_target_velocity": plan_target,
-        }
-
-
-class MossActionVLA(nn.Module):
-    def __init__(self, backbone: TruncatedMossBackbone, config: MossActionConfig):
-        super().__init__()
-        self.config = config
-        self.backbone = backbone
-        self.flow = StreamingFlowActionExpert(config)
-
-    def encode_memory(
-        self,
-        moss_inputs: Mapping[str, Any],
-        action_token_mask: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        needs_backbone_grad = any(
-            parameter.requires_grad for parameter in self.backbone.parameters()
-        )
-        with nullcontext() if needs_backbone_grad else torch.no_grad():
-            taps = self.backbone(**dict(moss_inputs))
-        return self.flow.encode_memory(
-            taps.hidden, taps.text_mask, readout_mask=action_token_mask
-        )
+        queries = self.decoder.query_embeddings(condition, query_delays.to(prefix))
+        # The prefix summary reaches every query, so the queries stay a chunk-wide
+        # plan rather than K independent single-step regressions.
+        return self.decoder(queries + prefix.unsqueeze(1))
 
     def forward(
         self,
         moss_inputs: Mapping[str, Any],
         robot_state: torch.Tensor,
+        state_difference: torch.Tensor,
         actions: torch.Tensor,
-        valid_mask: torch.Tensor | None = None,
+        visual_age: torch.Tensor,
         *,
-        flow_centers: torch.Tensor,
-        flow_times: torch.Tensor,
+        query_delays: torch.Tensor | None = None,
+        valid_mask: torch.Tensor | None = None,
         action_token_mask: torch.Tensor | None = None,
-        noise: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
-        memory = self.encode_memory(moss_inputs, action_token_mask)
-        loss, details = self.flow.loss(
-            actions,
-            memory,
+        predicted = self.predict_chunk(
+            moss_inputs,
             robot_state,
-            valid_mask,
-            flow_centers=flow_centers,
-            times=flow_times,
-            noise=noise,
+            state_difference,
+            visual_age,
+            query_delays=query_delays,
+            action_token_mask=action_token_mask,
         )
-        return {"loss": loss, "memory": memory, **details}
-
-    @torch.no_grad()
-    def stream_action(
-        self,
-        memory: torch.Tensor,
-        robot_state: torch.Tensor,
-        *,
-        state: StreamingActionState | None = None,
-        reference_action: torch.Tensor | None = None,
-        noise: torch.Tensor | None = None,
-        clamp: bool = True,
-    ) -> tuple[torch.Tensor, StreamingActionState]:
-        batch = memory.shape[0]
-        expected = (batch, self.config.action_dim)
-        if state is None or state.step >= self.config.horizon - 1:
-            if reference_action is None:
-                reference_action = (
-                    torch.zeros(expected, device=memory.device, dtype=memory.dtype)
-                    if state is None
-                    else state.action
-                )
-            reference_action = reference_action.to(memory)
-            if reference_action.shape != expected:
-                raise ValueError(f"reference_action must have shape {expected}")
-            noise = torch.randn_like(reference_action) if noise is None else noise.to(memory)
-            if noise.shape != expected:
-                raise ValueError(f"stream action noise must have shape {expected}")
-            state = StreamingActionState(
-                reference_action + self.config.initial_action_noise * noise
+        target = actions.to(predicted)
+        if target.shape != predicted.shape:
+            raise ValueError(
+                f"actions must have shape {tuple(predicted.shape)}, got {tuple(target.shape)}"
             )
-        elif state.action.shape != expected:
-            raise ValueError(f"stream action state must have shape {expected}")
-
-        time_value = state.step / (self.config.horizon - 1)
-        times = torch.full(
-            (batch,), time_value, device=memory.device, dtype=memory.dtype
-        )
-        action = state.action + self.flow(
-            state.action, times, memory, robot_state
-        ) / (self.config.horizon - 1)
-        if clamp:
-            action = action.clamp(-1.0, 1.0)
-        return action, StreamingActionState(action, state.step + 1)
+        errors = (predicted - target).abs().mean(dim=-1)
+        if valid_mask is None:
+            loss = errors.mean()
+        else:
+            weights = valid_mask.to(errors)
+            if weights.shape != errors.shape:
+                raise ValueError("valid_mask must align with the action chunk")
+            total = weights.sum()
+            if not bool(total > 0):
+                raise ValueError("every planning time needs at least one valid action")
+            loss = (errors * weights).sum() / total
+        return {"loss": loss, "predicted_actions": predicted}
 
     def create_stream(
         self,
@@ -758,7 +793,7 @@ class MossActionVLA(nn.Module):
 
 
 class StreamingMossActionSession:
-    """One incremental MOSS cache plus persistent action flow per robot episode."""
+    """One append-only MOSS cache per episode; action queries never persist."""
 
     def __init__(
         self,
@@ -792,6 +827,7 @@ class StreamingMossActionSession:
         self.state = policy.backbone.start_stream(input_ids)
         self.origin_timestamp: float | None = None
         self.last_timestamp: float | None = None
+        self.last_frame_timestamp: float | None = None
 
     def _append_frame(
         self,
@@ -821,37 +857,88 @@ class StreamingMossActionSession:
             key: value.to(device) if isinstance(value, torch.Tensor) else value
             for key, value in frame_inputs.items()
         }
-        return self.policy.backbone.append_stream_frame(self.state, frame_inputs)
+        taps = self.policy.backbone.append_stream_frame(self.state, frame_inputs)
+        self.last_frame_timestamp = timestamp
+        return taps
 
-    def encode_frame(
-        self,
-        image: Any,
-        *,
-        timestamp: float | None = None,
-    ) -> torch.Tensor:
-        """Append one frame and project its latest MOSS taps into action memory."""
-        taps = self._append_frame(image, timestamp=timestamp)
-        return self.policy.flow.encode_memory(taps.hidden, taps.text_mask)
+    def append_frame(self, image: Any, *, timestamp: float | None = None) -> None:
+        """Grow the visual KV cache without planning."""
+        self._append_frame(image, timestamp=timestamp)
+
+    # Kept for the async perception worker, which encodes frames on its own thread.
+    def encode_frame(self, image: Any, *, timestamp: float | None = None) -> float:
+        self._append_frame(image, timestamp=timestamp)
+        return float(self.last_frame_timestamp)
 
     @torch.no_grad()
-    def predict_action(
+    def plan(
+        self,
+        robot_state: torch.Tensor,
+        state_difference: torch.Tensor,
+        *,
+        plan_timestamp: float | None = None,
+        inference_latency: float = 0.0,
+        clamp: bool = True,
+    ) -> ActionChunk:
+        """Decode one micro-chunk from the committed prefix, then drop the queries."""
+        if self.last_frame_timestamp is None:
+            raise RuntimeError("a frame must be appended before planning")
+        plan_timestamp = (
+            time.monotonic() if plan_timestamp is None else float(plan_timestamp)
+        )
+        if not math.isfinite(plan_timestamp):
+            raise ValueError("plan timestamp must be finite")
+        visual_age = max(0.0, plan_timestamp - self.last_frame_timestamp)
+        device = next(self.policy.parameters()).device
+        dtype = self.policy.decoder.query_embedding.dtype
+        robot_state = robot_state.to(device=device, dtype=dtype)
+        state_difference = state_difference.to(device=device, dtype=dtype)
+        if robot_state.ndim == 1:
+            robot_state = robot_state.unsqueeze(0)
+        if state_difference.ndim == 1:
+            state_difference = state_difference.unsqueeze(0)
+        if robot_state.shape[0] != 1:
+            raise ValueError("a streaming session plans for one robot at a time")
+        age = torch.full((1,), visual_age, device=device, dtype=dtype)
+        delays = self.policy.default_query_delays(
+            age, inference_latency=inference_latency
+        )
+        condition = self.policy.decoder.condition(
+            robot_state, state_difference, age
+        )
+        queries = self.policy.decoder.query_embeddings(condition, delays)
+        hidden = self.policy.backbone.decode_action_queries(self.state, queries)
+        actions = self.policy.decoder(hidden)
+        if clamp:
+            actions = actions.clamp(-1.0, 1.0)
+        return ActionChunk(
+            actions=actions[0],
+            start_time=plan_timestamp + inference_latency,
+            plan_time=plan_timestamp,
+            interval=self.policy.config.control_interval,
+            visual_age=visual_age,
+        )
+
+    @torch.no_grad()
+    def predict_chunk(
         self,
         image: Any,
         robot_state: torch.Tensor,
+        state_difference: torch.Tensor,
         *,
         timestamp: float | None = None,
-        action_state: StreamingActionState | None = None,
-        reference_action: torch.Tensor | None = None,
-        noise: torch.Tensor | None = None,
+        plan_timestamp: float | None = None,
+        inference_latency: float = 0.0,
         clamp: bool = True,
-    ) -> tuple[torch.Tensor, StreamingActionState]:
-        memory = self.encode_frame(image, timestamp=timestamp)
-        return self.policy.stream_action(
-            memory,
+    ) -> ActionChunk:
+        self._append_frame(image, timestamp=timestamp)
+        return self.plan(
             robot_state,
-            state=action_state,
-            reference_action=reference_action,
-            noise=noise,
+            state_difference,
+            plan_timestamp=plan_timestamp
+            if plan_timestamp is not None
+            else self.last_frame_timestamp,
+            inference_latency=inference_latency,
             clamp=clamp,
         )
 

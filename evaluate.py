@@ -26,10 +26,10 @@ from model import (
 )
 from streaming import (
     AsyncPerception,
-    LatestAction,
+    ChunkExecutor,
+    ChunkPlanner,
     LatestObservation,
     Observation,
-    StreamingActionWorker,
 )
 
 os.environ.setdefault("MUJOCO_GL", "egl")
@@ -70,9 +70,23 @@ def parse_args() -> argparse.Namespace:
         default="streaming-kv",
     )
     parser.add_argument("--control-hz", type=float, default=10.0)
+    parser.add_argument(
+        "--plan-hz", type=float, default=5.0, help="micro-chunk replanning rate"
+    )
+    parser.add_argument(
+        "--execute-steps",
+        type=int,
+        default=0,
+        help="blocking mode: actions executed per chunk (0 = half the chunk)",
+    )
+    parser.add_argument(
+        "--ensemble-lambda",
+        type=float,
+        help="enable ACT-style temporal ensembling with this decay; "
+        "omit to let the newest chunk win and measure raw boundary jumps",
+    )
     parser.add_argument("--startup-timeout", type=float, default=30.0)
     parser.add_argument("--action-delay-ms", type=float, default=0.0)
-    parser.add_argument("--fixed-noise", action="store_true")
     parser.add_argument("--settle-steps", type=int, default=10)
     parser.add_argument("--seed", type=int, default=1000)
     parser.add_argument("--device", default="cuda")
@@ -91,6 +105,12 @@ def parse_args() -> argparse.Namespace:
         parser.error("invalid settle, timeout, or camera size")
     if args.action_delay_ms < 0:
         parser.error("--action-delay-ms must be nonnegative")
+    if args.plan_hz <= 0 or args.plan_hz > args.control_hz:
+        parser.error("--plan-hz must be positive and at most --control-hz")
+    if args.execute_steps < 0:
+        parser.error("--execute-steps must be nonnegative")
+    if args.ensemble_lambda is not None and args.ensemble_lambda < 0:
+        parser.error("--ensemble-lambda must be nonnegative")
     return args
 
 
@@ -143,21 +163,21 @@ def _image(observation: Mapping[str, np.ndarray]) -> Image.Image:
 
 def _build_policy(args: argparse.Namespace):
     payload = torch.load(args.policy, map_location="cpu", weights_only=True)
-    if payload.get("format") != "moss_action_v5":
-        raise ValueError("policy is not a moss_action_v5 checkpoint")
+    if payload.get("format") != "moss_action_v6":
+        raise ValueError("policy is not a moss_action_v6 checkpoint")
     contract = payload.get("training_contract", {})
     required_contract = {
         "retained_layers": 24,
         "retained_cross_attention_layers": [2, 6, 10, 14, 18, 22],
-        "raw_taps": [14, 18, 23],
-        "action_decoder": "cross_attention_streaming_flow",
-        "action_memory": "fresh_fused_h14_h18_h23",
-        "runtime": "continuous_moss_action_stream_v1",
-        "supervision": "every_frame_end",
-        "action_generation": "one_velocity_step_per_control_tick",
-        "flow_objective": "online_stabilized_plus_trajectory_cfm",
+        "action_decoder": "ephemeral_action_queries",
+        "action_memory": "final_hidden_state",
+        "action_history": "none",
+        "runtime": "streaming_action_query_decoder_v1",
+        "supervision": "one_micro_chunk_per_planning_time",
+        "action_generation": "continuous_micro_chunk_l1",
+        "delay_aware": "per_query_visual_age",
         "stage": "streaming",
-        "training_context": "causal_full_episode_prefix",
+        "training_context": "single_planning_time",
         "backbone_training": "full",
     }
     mismatched = {
@@ -173,10 +193,8 @@ def _build_policy(args: argparse.Namespace):
     ):
         raise ValueError("policy was not trained with a valid causal stream")
     config = MossActionConfig(**payload["config"])
-    if (config.state_dim, config.action_dim, config.horizon) != (9, 7, 50):
-        raise ValueError(
-            "LIBERO evaluation requires state D9, action A7, and horizon H50"
-        )
+    if (config.state_dim, config.action_dim) != (9, 7):
+        raise ValueError("LIBERO evaluation requires state D9 and action A7")
     normalization = payload.get("normalization", {})
     low = np.asarray(normalization.get("state_q01"), dtype=np.float32)
     high = np.asarray(normalization.get("state_q99"), dtype=np.float32)
@@ -226,33 +244,23 @@ def _pipeline_functions(
     instruction: str,
     device: torch.device,
     dtype: torch.dtype,
-    fixed_noise: bool,
-    seed: int,
     action_delay_ms: float,
     backbone_mode: str,
+    control_interval: float,
 ):
-    noise = None
-    if fixed_noise:
-        generator = torch.Generator(device=device).manual_seed(seed)
-        noise = torch.randn(
-            1,
-            policy.config.action_dim,
-            generator=generator,
-            device=device,
-            dtype=dtype,
-        )
+    """Return (encode_frame, plan_chunk).
 
+    `encode_frame` only grows the visual cache; `plan_chunk` decodes one
+    micro-chunk from ephemeral queries and returns it with the timing metadata
+    the executor needs to place each action on the physical timeline.
+    """
     stream = None
-    history_images = []
-    history_timestamps = []
-    history_origin = None
-    action_state = None
-    initial_action = torch.zeros(
-        1, policy.config.action_dim, device=device, dtype=dtype
-    )
-    initial_action[0, -1] = -1.0
+    history_images: list[Any] = []
+    history_timestamps: list[float] = []
+    history_origin: float | None = None
+    previous_state: np.ndarray | None = None
 
-    def encode(observation: Observation) -> torch.Tensor:
+    def encode(observation: Observation) -> float:
         nonlocal history_origin, stream
         with torch.inference_mode(), torch.autocast(
             device_type="cuda",
@@ -269,41 +277,76 @@ def _pipeline_functions(
                 history_origin = observation.timestamp
             history_images.append(observation.image)
             history_timestamps.append(observation.timestamp - history_origin)
-            moss_inputs = _move(
-                prepare_streaming_moss_inputs(
-                    processor,
-                    [history_images],
-                    [instruction],
-                    [history_timestamps],
-                ),
-                device,
-            )
-            return policy.encode_memory(moss_inputs)
+            return observation.timestamp
 
-    def next_action(observation: Observation) -> np.ndarray:
-        nonlocal action_state
-        state = torch.from_numpy(observation.robot_state).to(device).unsqueeze(0)
+    def plan(observation: Observation) -> dict[str, Any]:
+        nonlocal previous_state
+        current = observation.robot_state
+        difference = (
+            np.zeros_like(current)
+            if previous_state is None
+            else current - previous_state
+        )
+        previous_state = current
+        state = torch.from_numpy(current).to(device=device, dtype=dtype).unsqueeze(0)
+        delta = (
+            torch.from_numpy(difference).to(device=device, dtype=dtype).unsqueeze(0)
+        )
+        started = time.monotonic()
         with torch.inference_mode(), torch.autocast(
             device_type="cuda",
             dtype=dtype,
             enabled=device.type == "cuda" and dtype != torch.float32,
         ):
-            action, action_state = policy.stream_action(
-                observation.image,
-                state,
-                state=action_state,
-                reference_action=initial_action if action_state is None else None,
-                noise=noise,
-                clamp=True,
-            )
-        result = action[0].float().cpu().numpy()
+            if backbone_mode == "streaming-kv":
+                if stream is None:
+                    raise RuntimeError("a frame must be encoded before planning")
+                chunk = stream.plan(
+                    state,
+                    delta,
+                    plan_timestamp=started,
+                    inference_latency=action_delay_ms / 1000.0,
+                )
+                actions = chunk.actions
+                visual_age = chunk.visual_age
+            else:
+                moss_inputs = _move(
+                    prepare_streaming_moss_inputs(
+                        processor,
+                        [history_images],
+                        [instruction],
+                        [history_timestamps],
+                    ),
+                    device,
+                )
+                visual_age = max(
+                    0.0,
+                    started - (history_origin + history_timestamps[-1]),
+                )
+                age = torch.full((1,), visual_age, device=device, dtype=dtype)
+                actions = policy.predict_chunk(
+                    moss_inputs,
+                    state,
+                    delta,
+                    age,
+                    query_delays=policy.default_query_delays(
+                        age, inference_latency=action_delay_ms / 1000.0
+                    ),
+                )[0].clamp(-1.0, 1.0)
+        result = actions.float().cpu().numpy()
         if not np.isfinite(result).all():
             raise RuntimeError("policy produced non-finite actions")
         if action_delay_ms:
             time.sleep(action_delay_ms / 1000.0)
-        return result
+        return {
+            "actions": result,
+            "start_time": time.monotonic(),
+            "interval": control_interval,
+            "visual_age": visual_age,
+            "plan_latency": time.monotonic() - started,
+        }
 
-    return encode, next_action
+    return encode, plan
 
 
 def _settle(
@@ -322,42 +365,66 @@ def _blocking_rollout(
     env: Any,
     observation: Mapping[str, np.ndarray],
     encode_fn: Any,
-    action_fn: Any,
+    plan_fn: Any,
     normalization: Mapping[str, Any],
     horizon: int,
+    execute_steps: int,
+    ensemble_lambda: float | None,
+    control_interval: float,
 ) -> tuple[bool, int, dict[str, Any]]:
+    """Receding horizon: replan every `execute_steps` actions, drop the rest."""
+    executor = ChunkExecutor(ensemble_lambda=ensemble_lambda)
     gripper = -1.0
-    for step in range(horizon):
+    steps = 0
+    chunks_planned = 0
+    jumps: list[float] = []
+    previous = None
+    while steps < horizon:
         snapshot = Observation(
-            step + 1,
+            steps + 1,
             _image(observation),
             _robot_state(observation, normalization),
             time.monotonic(),
         )
-        encoded = Observation(
-            snapshot.version,
-            encode_fn(snapshot),
-            snapshot.robot_state,
-            snapshot.timestamp,
-        )
-        action = action_fn(encoded)
-        gripper = (
-            gripper if abs(float(action[-1])) <= 0.2 else float(np.sign(action[-1]))
-        )
-        action[-1] = gripper
-        observation, _, done, _ = env.step(action)
-        if env.check_success():
-            return True, step + 1, {}
-        if done:
-            return False, step + 1, {}
-    return False, horizon, {}
+        encode_fn(snapshot)
+        plan = plan_fn(snapshot)
+        # A virtual clock keeps blocking mode deterministic: chunk index j is
+        # simply the j-th executed step, independent of wall-clock jitter.
+        executor.submit(plan["actions"], float(steps), 1.0, plan["visual_age"])
+        chunks_planned += 1
+        for offset in range(execute_steps):
+            if steps >= horizon:
+                break
+            action = executor.action_at(float(steps)).copy()
+            if previous is not None and offset == 0:
+                jumps.append(float(np.abs(action - previous).max()))
+            previous = action.copy()
+            gripper = (
+                gripper if abs(float(action[-1])) <= 0.2 else float(np.sign(action[-1]))
+            )
+            action[-1] = gripper
+            observation, _, done, _ = env.step(action)
+            steps += 1
+            if env.check_success():
+                return True, steps, _chunk_stats(chunks_planned, jumps)
+            if done:
+                return False, steps, _chunk_stats(chunks_planned, jumps)
+    return False, steps, _chunk_stats(chunks_planned, jumps)
+
+
+def _chunk_stats(chunks_planned: int, jumps: list[float]) -> dict[str, Any]:
+    return {
+        "chunks_planned": chunks_planned,
+        "mean_boundary_jump": float(np.mean(jumps)) if jumps else 0.0,
+        "max_boundary_jump": max(jumps, default=0.0),
+    }
 
 
 def _async_rollout(
     env: Any,
     observation: Mapping[str, np.ndarray],
     encode_fn: Any,
-    action_fn: Any,
+    plan_fn: Any,
     normalization: Mapping[str, Any],
     horizon: int,
     args: argparse.Namespace,
@@ -365,46 +432,53 @@ def _async_rollout(
     period = 1.0 / args.control_hz
     mailbox = LatestObservation()
     features = LatestObservation()
-    actions = LatestAction()
+    executor = ChunkExecutor(ensemble_lambda=args.ensemble_lambda)
     perception = AsyncPerception(mailbox, features, encode_fn)
-    action_worker = StreamingActionWorker(
-        features, actions, action_fn, period=period, states=mailbox
+    planner = ChunkPlanner(
+        features,
+        executor,
+        plan_fn,
+        period=1.0 / args.plan_hz,
+        states=mailbox,
     )
     perception.start()
-    action_worker.start()
+    planner.start()
     mailbox.publish(_image(observation), _robot_state(observation, normalization))
-    current = actions.wait_for_new(0, timeout=args.startup_timeout)
-    if current is None:
-        action_worker.stop()
+    if not planner.wait_for_first_chunk(args.startup_timeout):
+        planner.stop()
         perception.stop()
         perception.raise_if_failed()
-        action_worker.raise_if_failed()
-        raise TimeoutError("the first streamed action did not arrive in time")
+        planner.raise_if_failed()
+        raise TimeoutError("the first planned chunk did not arrive in time")
+    planner.raise_if_failed()
     success = False
     steps = 0
-    version = current.version
     gripper = -1.0
-    repeated_actions = 0
-    action_ages = []
+    stalls = 0
+    jumps: list[float] = []
+    previous = None
     deadline = time.monotonic()
     rollout_started = deadline
     try:
         for steps in range(1, horizon + 1):
-            if steps > 1:
-                latest = actions.wait_for_new(version, timeout=0.0)
-                if latest is None:
-                    repeated_actions += 1
-                else:
-                    current = latest
-                    version = latest.version
-            action = current.value.copy()
+            try:
+                action = executor.action_at(time.monotonic()).copy()
+            except RuntimeError:
+                # The newest chunk ran out before a replan landed; hold the last
+                # action rather than pretending a fresh one existed.
+                if previous is None:
+                    raise
+                stalls += 1
+                action = previous.copy()
+            if previous is not None:
+                jumps.append(float(np.abs(action - previous).max()))
+            previous = action.copy()
             gripper = (
                 gripper
                 if abs(float(action[-1])) <= 0.2
                 else float(np.sign(action[-1]))
             )
             action[-1] = gripper
-            action_ages.append(max(0.0, time.monotonic() - current.observation_time))
             observation, _, done, _ = env.step(action)
             success = bool(env.check_success())
             if success or done:
@@ -413,30 +487,30 @@ def _async_rollout(
                 _image(observation), _robot_state(observation, normalization)
             )
             perception.raise_if_failed()
-            action_worker.raise_if_failed()
+            planner.raise_if_failed()
             deadline += period
             remaining = deadline - time.monotonic()
             if remaining > 0:
                 time.sleep(remaining)
     finally:
-        action_worker.stop()
+        planner.stop()
         perception.stop()
     perception.raise_if_failed()
-    action_worker.raise_if_failed()
+    planner.raise_if_failed()
     elapsed = max(time.monotonic() - rollout_started, 1e-6)
-    stats = {
-        "actions_generated": action_worker.actions_generated,
-        "repeated_actions": repeated_actions,
-        "stale_action_fraction": repeated_actions / max(steps, 1),
-        "mean_action_age": float(np.mean(action_ages)) if action_ages else 0.0,
-        "max_action_age": max(action_ages, default=0.0),
-        "action_flow_last_latency": action_worker.last_latency,
-        "action_frequency_hz": action_worker.actions_generated / elapsed,
+    return success, steps, {
+        "chunks_planned": planner.chunks_planned,
+        "chunk_stalls": stalls,
+        "stall_fraction": stalls / max(steps, 1),
+        "mean_step_delta": float(np.mean(jumps)) if jumps else 0.0,
+        "max_step_delta": max(jumps, default=0.0),
+        "plan_last_latency": planner.last_latency,
+        "plan_frequency_hz": planner.chunks_planned / elapsed,
+        "last_visual_age": planner.last_visual_age,
+        "perception_last_latency": perception.last_latency,
+        "frames_encoded": perception.frames_encoded,
+        "perception_frequency_hz": perception.frames_encoded / elapsed,
     }
-    stats["perception_last_latency"] = perception.last_latency
-    stats["frames_encoded"] = perception.frames_encoded
-    stats["perception_frequency_hz"] = perception.frames_encoded / elapsed
-    return success, steps, stats
 
 
 def main() -> None:
@@ -453,6 +527,12 @@ def main() -> None:
 
     suite = benchmark.get_benchmark_dict()[args.suite]()
     horizon = args.horizon or SUITE_HORIZONS[args.suite]
+    execute_steps = args.execute_steps or max(1, policy.config.chunk_size // 2)
+    if execute_steps > policy.config.chunk_size:
+        raise ValueError(
+            f"--execute-steps {execute_steps} exceeds chunk size "
+            f"{policy.config.chunk_size}"
+        )
     records = []
     per_task_success = []
     for task_id in args.task_ids:
@@ -480,36 +560,37 @@ def main() -> None:
                 env.reset()
                 observation = env.set_init_state(init_state)
                 observation = _settle(env, observation, args.settle_steps)
-                encode_fn, action_fn = _pipeline_functions(
+                encode_fn, plan_fn = _pipeline_functions(
                     policy,
                     processor,
                     task.language.strip(),
                     device,
                     dtype,
-                    args.fixed_noise,
-                    seed,
                     args.action_delay_ms,
                     args.backbone_mode,
+                    1.0 / args.control_hz,
                 )
-                rollout = _async_rollout if args.mode == "async" else _blocking_rollout
                 if args.mode == "async":
-                    success, steps, metrics = rollout(
+                    success, steps, metrics = _async_rollout(
                         env,
                         observation,
                         encode_fn,
-                        action_fn,
+                        plan_fn,
                         payload["normalization"],
                         horizon,
                         args,
                     )
                 else:
-                    success, steps, metrics = rollout(
+                    success, steps, metrics = _blocking_rollout(
                         env,
                         observation,
                         encode_fn,
-                        action_fn,
+                        plan_fn,
                         payload["normalization"],
                         horizon,
+                        execute_steps,
+                        args.ensemble_lambda,
+                        1.0 / args.control_hz,
                     )
                 wins += int(success)
                 record = {
@@ -537,6 +618,10 @@ def main() -> None:
         "mode": args.mode,
         "backbone_mode": args.backbone_mode,
         "action_delay_ms": args.action_delay_ms,
+        "chunk_size": policy.config.chunk_size,
+        "execute_steps": execute_steps,
+        "plan_hz": args.plan_hz,
+        "ensemble_lambda": args.ensemble_lambda,
         "task_macro_success": float(np.mean(per_task_success)),
         "overall_success": float(np.mean([record["success"] for record in records])),
         "per_task_success": dict(zip(map(str, args.task_ids), per_task_success)),

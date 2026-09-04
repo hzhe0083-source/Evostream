@@ -69,28 +69,40 @@ def _demo_names(data_group: Any) -> list[str]:
 
 
 class LiberoHDF5Dataset(Dataset):
-    """One full causal episode with an action target at every sampled frame."""
+    """One planning time per sample: a visual prefix plus one action chunk.
+
+    Every item is a single planning decision, not a whole episode. That keeps the
+    ephemeral action queries ephemeral: because a sample stops at the planning
+    time, no later frame can ever attend to a chunk that was only planned. The
+    prefix is deliberately cut `visual_age` seconds before the planning time so
+    training sees the same stale-vision regime the asynchronous runtime produces.
+    """
 
     def __init__(
         self,
         data: str | Path | Sequence[str | Path],
         *,
-        horizon: int = 50,
+        chunk_size: int = 8,
         action_offset: int = 1,
         frame_stride: int = 1,
         frame_interval: float = 0.1,
+        context_frames: int = 8,
+        max_visual_age_steps: int = 2,
         state_low: np.ndarray | None = None,
         state_high: np.ndarray | None = None,
+        seed: int = 0,
     ) -> None:
         if (
-            horizon < 2
+            chunk_size < 1
             or action_offset < 0
             or frame_stride < 1
             or frame_interval <= 0
+            or context_frames < 1
+            or max_visual_age_steps < 0
         ):
             raise ValueError(
-                "horizon must be at least two; stride/frame_interval positive; "
-                "action_offset nonnegative"
+                "chunk_size/context_frames/stride/frame_interval must be positive; "
+                "action_offset and max_visual_age_steps nonnegative"
             )
         try:
             import h5py
@@ -101,11 +113,15 @@ class LiberoHDF5Dataset(Dataset):
         self.files = sorted(
             {file for entry in entries for file in discover_hdf5(entry)}
         )
-        self.horizon = horizon
+        self.chunk_size = chunk_size
         self.action_offset = action_offset
         self.frame_stride = frame_stride
         self.frame_interval = frame_interval
+        self.context_frames = context_frames
+        self.max_visual_age_steps = max_visual_age_steps
+        self.seed = seed
         self.samples: list[LiberoSampleRef] = []
+        self.planning_times: list[int] = []
         states: list[np.ndarray] = []
         for path in self.files:
             with h5py.File(path, "r") as handle:
@@ -139,9 +155,10 @@ class LiberoHDF5Dataset(Dataset):
                             f"{path}:{demo_name} has no causally aligned action"
                         )
                     states.append(episode_states)
-                    self.samples.append(
-                        LiberoSampleRef(path, demo_name, instruction)
-                    )
+                    reference = LiberoSampleRef(path, demo_name, instruction)
+                    for planning_time in range(0, last_observation, frame_stride):
+                        self.samples.append(reference)
+                        self.planning_times.append(planning_time)
 
         if not self.samples:
             raise ValueError("no causally aligned LIBERO training samples found")
@@ -168,79 +185,89 @@ class LiberoHDF5Dataset(Dataset):
     def __len__(self) -> int:
         return len(self.samples)
 
+    def _visual_age_steps(self, index: int) -> int:
+        """Deterministic per-sample staleness so epochs stay reproducible."""
+        if self.max_visual_age_steps == 0:
+            return 0
+        generator = np.random.default_rng((self.seed, index))
+        return int(generator.integers(0, self.max_visual_age_steps + 1))
+
     def __getitem__(self, index: int) -> dict[str, Any]:
         import h5py
 
         ref = self.samples[index]
+        planning_time = self.planning_times[index]
+        age_steps = self._visual_age_steps(index)
         # ponytail: reopen per sample for worker safety; cache handles only if I/O profiles hot.
         with h5py.File(ref.path, "r") as handle:
             demo = handle["data"][ref.demo]
             observations = demo["obs"]
-            last_observation = min(
-                len(observations["joint_states"]),
-                len(observations["agentview_rgb"]),
-                len(demo["actions"]) - self.action_offset,
+
+            # The newest visible frame is `age_steps` behind the planning time,
+            # which is what the asynchronous runtime delivers.
+            newest_frame = max(0, planning_time - age_steps)
+            first_frame = max(
+                0, newest_frame - (self.context_frames - 1) * self.frame_stride
             )
-            supervised_indices = list(range(0, last_observation, self.frame_stride))
-            frame_indices = supervised_indices
+            frame_indices = list(
+                range(first_frame, newest_frame + 1, self.frame_stride)
+            )
+            if frame_indices[-1] != newest_frame:
+                frame_indices.append(newest_frame)
             images = [
                 Image.fromarray(upright_libero_image(observations["agentview_rgb"][step]))
                 for step in frame_indices
             ]
+
+            previous_time = max(0, planning_time - 1)
+            # h5py fancy indexing requires increasing order, so read the pair in
+            # chronological order and keep [current, previous] afterwards.
+            rows = sorted({previous_time, planning_time})
             raw_states = np.concatenate(
                 (
-                    observations["joint_states"][supervised_indices],
-                    observations["gripper_states"][supervised_indices],
+                    observations["joint_states"][rows],
+                    observations["gripper_states"][rows],
                 ),
                 axis=-1,
             ).astype(np.float32)
-            chunks = []
-            valid_masks = []
-            flow_centers = []
-            flow_times = []
-            for step in supervised_indices:
-                start = step + self.action_offset
-                chunk = demo["actions"][start : start + self.horizon].astype(
-                    np.float32
-                )
-                valid = np.arange(self.horizon) < len(chunk)
-                if not valid.any():
-                    raise RuntimeError("stream frame produced an empty action target")
-                if len(chunk) < self.horizon:
-                    chunk = np.concatenate(
-                        (
-                            chunk,
-                            np.repeat(chunk[-1:], self.horizon - len(chunk), axis=0),
-                        )
-                    )
-                chunks.append(chunk)
-                valid_masks.append(valid)
-                flow_centers.append(
-                    demo["actions"][max(0, start - 1)].astype(np.float32)
-                )
-                flow_times.append(
-                    (step % (self.horizon - 1)) / (self.horizon - 1)
+            current_row = raw_states[-1]
+            previous_row = raw_states[0]
+
+            start = planning_time + self.action_offset
+            chunk = demo["actions"][start : start + self.chunk_size].astype(np.float32)
+            valid = np.arange(self.chunk_size) < len(chunk)
+            if not valid.any():
+                raise RuntimeError("planning time produced an empty action target")
+            if len(chunk) < self.chunk_size:
+                chunk = np.concatenate(
+                    (chunk, np.repeat(chunk[-1:], self.chunk_size - len(chunk), axis=0))
                 )
 
-        actions = np.stack(chunks)
-        if not np.isfinite(actions).all() or np.abs(actions).max(initial=0.0) > 1.0001:
+        if not np.isfinite(chunk).all() or np.abs(chunk).max(initial=0.0) > 1.0001:
             raise ValueError(
                 f"raw OSC actions outside [-1,1] at {ref.path}:{ref.demo}"
             )
+        normalized = normalize_state(
+            np.stack((current_row, previous_row)), self.state_low, self.state_high
+        )
+        visual_age = float(age_steps * self.frame_interval)
+        query_delays = (
+            visual_age
+            + np.arange(self.chunk_size, dtype=np.float32) * self.frame_interval
+        )
         return {
             "stream_id": (str(ref.path), ref.demo),
+            "planning_time": planning_time,
             "images": images,
-            "supervised_frames": len(supervised_indices),
             "frame_timestamps": np.asarray(frame_indices, dtype=np.float32)
             * self.frame_interval,
             "instruction": ref.instruction,
-            "robot_state": normalize_state(
-                raw_states, self.state_low, self.state_high
-            ),
-            "flow_centers": np.stack(flow_centers),
-            "flow_times": np.asarray(flow_times, dtype=np.float32),
-            "actions": actions,
-            "action_valid_mask": np.stack(valid_masks),
+            "robot_state": normalized[0],
+            "state_difference": (normalized[0] - normalized[1]).astype(np.float32),
+            "visual_age": np.float32(visual_age),
+            "query_delays": query_delays.astype(np.float32),
+            "actions": chunk,
+            "action_valid_mask": valid,
         }
 
     @property
@@ -359,26 +386,28 @@ class MossActionCollator:
             raise ValueError(
                 f"frame-end tokens do not align with stream frames: {actual} != {expected}"
             )
+        # Exactly one readout per sample: the newest frame at this planning time.
         action_token_mask = torch.zeros_like(frame_token_mask)
-        for sample, row in enumerate(rows):
+        for sample in range(len(rows)):
             positions = frame_token_mask[sample].nonzero(as_tuple=True)[0]
-            action_token_mask[sample, positions[-row["supervised_frames"] :]] = True
+            action_token_mask[sample, positions[-1]] = True
         return {
             "moss_inputs": moss_inputs,
             "action_token_mask": action_token_mask,
             "robot_state": torch.from_numpy(
-                np.concatenate([row["robot_state"] for row in rows], axis=0)
+                np.stack([row["robot_state"] for row in rows])
             ),
-            "flow_centers": torch.from_numpy(
-                np.concatenate([row["flow_centers"] for row in rows], axis=0)
+            "state_difference": torch.from_numpy(
+                np.stack([row["state_difference"] for row in rows])
             ),
-            "flow_times": torch.from_numpy(
-                np.concatenate([row["flow_times"] for row in rows], axis=0)
+            "visual_age": torch.from_numpy(
+                np.asarray([row["visual_age"] for row in rows], dtype=np.float32)
             ),
-            "actions": torch.from_numpy(
-                np.concatenate([row["actions"] for row in rows], axis=0)
+            "query_delays": torch.from_numpy(
+                np.stack([row["query_delays"] for row in rows])
             ),
+            "actions": torch.from_numpy(np.stack([row["actions"] for row in rows])),
             "action_valid_mask": torch.from_numpy(
-                np.concatenate([row["action_valid_mask"] for row in rows], axis=0)
+                np.stack([row["action_valid_mask"] for row in rows])
             ),
         }

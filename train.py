@@ -51,14 +51,26 @@ def parse_args() -> argparse.Namespace:
         default=0.1,
         help="seconds per raw demo step",
     )
+    parser.add_argument(
+        "--chunk-size", type=int, default=8, help="actions per micro-chunk"
+    )
+    parser.add_argument(
+        "--context-frames",
+        type=int,
+        default=8,
+        help="visual frames kept before each planning time",
+    )
+    parser.add_argument(
+        "--max-visual-age-steps",
+        type=int,
+        default=2,
+        help="delay-aware training: how stale the newest frame may be",
+    )
     parser.add_argument("--overfit-one", action="store_true")
-    parser.add_argument("--fixed-flow-noise", action="store_true")
     parser.add_argument("--workers", type=int, default=0)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--backbone-lr", type=float, default=1e-5)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
-    parser.add_argument("--initial-action-noise", type=float, default=0.1)
-    parser.add_argument("--stabilization", type=float, default=10.0)
     parser.add_argument("--save-every", type=int, default=1000)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", default="cuda")
@@ -75,15 +87,20 @@ def parse_args() -> argparse.Namespace:
         args.gradient_accumulation,
         args.frame_stride,
         args.frame_interval,
+        args.chunk_size,
+        args.context_frames,
         args.lr,
         args.backbone_lr,
-        args.initial_action_noise,
-        args.stabilization,
         args.save_every,
     )
-    if any(value <= 0 for value in positive) or args.action_offset < 0:
+    if (
+        any(value <= 0 for value in positive)
+        or args.action_offset < 0
+        or args.max_visual_age_steps < 0
+    ):
         parser.error(
-            "training counts/rates must be positive and action-offset nonnegative"
+            "training counts/rates must be positive; action-offset and "
+            "max-visual-age-steps nonnegative"
         )
     if args.max_steps is not None and args.max_steps < 1:
         parser.error("--max-steps must be positive")
@@ -112,7 +129,7 @@ def _load_action_payload(path: Path | None) -> dict[str, Any] | None:
     if not path.is_file():
         raise FileNotFoundError(path)
     payload = torch.load(path, map_location="cpu", weights_only=True)
-    if payload.get("format") != "moss_action_v5":
+    if payload.get("format") != "moss_action_v6":
         raise ValueError(f"unsupported action checkpoint: {path}")
     return payload
 
@@ -135,8 +152,8 @@ def _build_policy(args: argparse.Namespace, initial: dict[str, Any] | None):
         if initial is not None
         else MossActionConfig(
             moss_hidden_size=hidden_size,
-            initial_action_noise=args.initial_action_noise,
-            stabilization=args.stabilization,
+            chunk_size=args.chunk_size,
+            control_interval=args.frame_interval * args.frame_stride,
         )
     )
     if config.moss_hidden_size != hidden_size:
@@ -165,7 +182,7 @@ def _save(
     audit: Any,
 ) -> None:
     payload = {
-        "format": "moss_action_v5",
+        "format": "moss_action_v6",
         "config": asdict(policy.config),
         "trainable_state": trainable_state_dict(policy),
         "normalization": normalization,
@@ -176,17 +193,19 @@ def _save(
             "stage": "streaming",
             "retained_layers": 24,
             "retained_cross_attention_layers": [2, 6, 10, 14, 18, 22],
-            "raw_taps": [14, 18, 23],
-            "action_decoder": "cross_attention_streaming_flow",
-            "action_memory": "fresh_fused_h14_h18_h23",
-            "runtime": "continuous_moss_action_stream_v1",
-            "training_context": "causal_full_episode_prefix",
-            "supervision": "every_frame_end",
-            "action_generation": "one_velocity_step_per_control_tick",
-            "flow_objective": "online_stabilized_plus_trajectory_cfm",
+            "action_decoder": "ephemeral_action_queries",
+            "action_memory": "final_hidden_state",
+            "action_history": "none",
+            "runtime": "streaming_action_query_decoder_v1",
+            "training_context": "single_planning_time",
+            "supervision": "one_micro_chunk_per_planning_time",
+            "action_generation": "continuous_micro_chunk_l1",
+            "delay_aware": "per_query_visual_age",
             "action_offset": args.action_offset,
             "frame_stride": args.frame_stride,
             "frame_interval": args.frame_interval,
+            "context_frames": args.context_frames,
+            "max_visual_age_steps": args.max_visual_age_steps,
             "backbone_training": "full",
             "backbone_lr": args.backbone_lr,
             "action_lr": args.lr,
@@ -212,7 +231,7 @@ def main() -> None:
         if (
             initial["training_contract"].get("backbone_training") != "full"
             or initial["training_contract"].get("training_context")
-            != "causal_full_episode_prefix"
+            != "single_planning_time"
         ):
             raise ValueError("initial checkpoint is not a full-parameter stream model")
         if (
@@ -224,6 +243,8 @@ def main() -> None:
             "action_offset": args.action_offset,
             "frame_stride": args.frame_stride,
             "frame_interval": args.frame_interval,
+            "context_frames": args.context_frames,
+            "max_visual_age_steps": args.max_visual_age_steps,
         }
         mismatched = {
             key: (initial["training_contract"].get(key), value)
@@ -232,17 +253,11 @@ def main() -> None:
         }
         if mismatched:
             raise ValueError(f"initial checkpoint data contract mismatch: {mismatched}")
-        expected_flow = {
-            "initial_action_noise": args.initial_action_noise,
-            "stabilization": args.stabilization,
-        }
-        mismatched_flow = {
-            key: (initial["config"].get(key), value)
-            for key, value in expected_flow.items()
-            if initial["config"].get(key) != value
-        }
-        if mismatched_flow:
-            raise ValueError(f"initial checkpoint Flow mismatch: {mismatched_flow}")
+        if initial["config"].get("chunk_size") != args.chunk_size:
+            raise ValueError(
+                "initial checkpoint chunk_size "
+                f"{initial['config'].get('chunk_size')} != {args.chunk_size}"
+            )
     policy, audit, device, dtype = _build_policy(args, initial)
     if initial is not None:
         del initial["trainable_state"]
@@ -268,10 +283,13 @@ def main() -> None:
     initial_normalization = None if initial is None else initial["normalization"]
     dataset = LiberoHDF5Dataset(
         args.data,
-        horizon=policy.config.horizon,
+        chunk_size=policy.config.chunk_size,
         action_offset=args.action_offset,
         frame_stride=args.frame_stride,
         frame_interval=args.frame_interval,
+        context_frames=args.context_frames,
+        max_visual_age_steps=args.max_visual_age_steps,
+        seed=args.seed,
         state_low=None
         if initial_normalization is None
         else initial_normalization["state_q01"],
@@ -298,7 +316,7 @@ def main() -> None:
         collate_fn=MossActionCollator(processor),
     )
     backbone_parameters = list(policy.backbone.parameters())
-    action_parameters = list(policy.flow.parameters())
+    action_parameters = list(policy.decoder.parameters())
     parameters = backbone_parameters + action_parameters
     optimizer = torch.optim.AdamW(
         [
@@ -310,28 +328,12 @@ def main() -> None:
     policy.train()
 
     max_steps = 1 if args.command == "preflight" else args.max_steps
-    fixed_noise: dict[tuple[int, ...], torch.Tensor] = {}
     global_step = 0
     optimizer.zero_grad(set_to_none=True)
     started = time.monotonic()
     for epoch in range(args.epochs):
         for batch_index, batch in enumerate(loader):
             batch = _move(batch, device)
-            noise = None
-            if args.fixed_flow_noise:
-                shape = (
-                    batch["actions"].shape[0],
-                    policy.config.action_dim,
-                )
-                if shape not in fixed_noise:
-                    generator = torch.Generator(device=device).manual_seed(args.seed)
-                    fixed_noise[shape] = torch.randn(
-                        shape,
-                        generator=generator,
-                        device=device,
-                        dtype=batch["actions"].dtype,
-                    )
-                noise = fixed_noise[shape]
             autocast = torch.autocast(
                 device_type="cuda",
                 dtype=dtype,
@@ -341,17 +343,17 @@ def main() -> None:
                 raw_loss = policy(
                     batch["moss_inputs"],
                     batch["robot_state"],
+                    batch["state_difference"],
                     batch["actions"],
-                    batch["action_valid_mask"],
-                    flow_centers=batch["flow_centers"],
-                    flow_times=batch["flow_times"],
+                    batch["visual_age"],
+                    query_delays=batch["query_delays"],
+                    valid_mask=batch["action_valid_mask"],
                     action_token_mask=batch["action_token_mask"],
-                    noise=noise,
                 )["loss"]
                 loss = raw_loss / args.gradient_accumulation
             if not bool(torch.isfinite(loss)):
                 raise RuntimeError(
-                    f"non-finite Flow loss at optimizer step {global_step}"
+                    f"non-finite action loss at optimizer step {global_step}"
                 )
             loss.backward()
             should_step = (
