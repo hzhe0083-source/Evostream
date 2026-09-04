@@ -343,12 +343,11 @@ def main() -> None:
                 raw_loss = policy(
                     batch["moss_inputs"],
                     batch["robot_state"],
-                    batch["state_difference"],
+                    batch["state_velocity"],
                     batch["actions"],
                     batch["visual_age"],
                     query_delays=batch["query_delays"],
                     valid_mask=batch["action_valid_mask"],
-                    action_token_mask=batch["action_token_mask"],
                 )["loss"]
                 loss = raw_loss / args.gradient_accumulation
             if not bool(torch.isfinite(loss)):

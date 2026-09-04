@@ -184,48 +184,64 @@ def _realtime_mrope_positions(
     image_token_id: int,
     merge_size: int,
 ) -> tuple[torch.Tensor, torch.Tensor, int]:
-    """Build MOSS XRoPE positions for newly appended single-frame segments."""
+    """Build MOSS XRoPE positions for arbitrary batch sizes and frame counts."""
+    batch_size, seq_len = input_ids.shape
     positions = torch.zeros(
-        3, 1, input_ids.shape[1], dtype=torch.long, device=input_ids.device
+        3, batch_size, seq_len, dtype=torch.long, device=input_ids.device
     )
-    vision_chunks = []
-    current = start
-    frame = 0
-    for token_index, token in enumerate(input_ids[0]):
-        if int(token) != image_token_id:
-            positions[:, 0, token_index] = current
-            current += 1
-            continue
-        if frame >= len(grid_thw):
-            raise ValueError("stream segment has more image tokens than frames")
-        _, grid_h, grid_w = map(int, grid_thw[frame].tolist())
-        height, width = grid_h // merge_size, grid_w // merge_size
-        y = torch.arange(height, device=input_ids.device).view(-1, 1)
-        x = torch.arange(width, device=input_ids.device).view(1, -1)
-        base = torch.full(
-            (height, width), current, dtype=torch.long, device=input_ids.device
-        )
-        grid_positions = torch.stack(
-            (base, base + y, base + x), dim=0
-        ).reshape(3, -1)
-        separator = current + max(height, width)
-        vision_chunks.append(
-            torch.cat(
-                (
-                    grid_positions,
-                    torch.full(
-                        (3, 1), separator, dtype=torch.long, device=input_ids.device
-                    ),
-                ),
-                dim=1,
+    all_vision_chunks = []
+    frame_offset = 0
+    max_next_position = start
+
+    for b in range(batch_size):
+        current = start
+        sample_vision_chunks = []
+        for token_index, token in enumerate(input_ids[b]):
+            if int(token) != image_token_id:
+                positions[:, b, token_index] = current
+                current += 1
+                continue
+            if frame_offset >= len(grid_thw):
+                raise ValueError("stream segment has more image tokens than frames")
+            _, grid_h, grid_w = map(int, grid_thw[frame_offset].tolist())
+            height, width = grid_h // merge_size, grid_w // merge_size
+            y = torch.arange(height, device=input_ids.device).view(-1, 1)
+            x = torch.arange(width, device=input_ids.device).view(1, -1)
+            base = torch.full(
+                (height, width), current, dtype=torch.long, device=input_ids.device
             )
+            grid_positions = torch.stack(
+                (base, base + y, base + x), dim=0
+            ).reshape(3, -1)
+            separator = current + max(height, width)
+            sample_vision_chunks.append(
+                torch.cat(
+                    (
+                        grid_positions,
+                        torch.full(
+                            (3, 1), separator, dtype=torch.long, device=input_ids.device
+                        ),
+                    ),
+                    dim=1,
+                )
+            )
+            positions[:, b, token_index] = separator
+            current = separator + 1
+            frame_offset += 1
+        max_next_position = max(max_next_position, current)
+        if sample_vision_chunks:
+            all_vision_chunks.append(torch.cat(sample_vision_chunks, dim=1))
+
+    if frame_offset != len(grid_thw):
+        raise ValueError(
+            f"stream segment image tokens ({frame_offset}) mismatch frames ({len(grid_thw)})"
         )
-        positions[:, 0, token_index] = separator
-        current = separator + 1
-        frame += 1
-    if frame != len(grid_thw):
-        raise ValueError("stream segment has fewer image tokens than frames")
-    return positions, torch.cat(vision_chunks, dim=1).unsqueeze(1), current
+    vision_positions = (
+        torch.cat(all_vision_chunks, dim=1).unsqueeze(1)
+        if all_vision_chunks
+        else torch.zeros(3, 1, 0, dtype=torch.long, device=input_ids.device)
+    )
+    return positions, vision_positions, max_next_position
 
 
 class TruncatedMossBackbone(nn.Module):
@@ -298,39 +314,118 @@ class TruncatedMossBackbone(nn.Module):
         moss_inputs: Mapping[str, Any],
         query_embeds: torch.Tensor,
     ) -> torch.Tensor:
-        """Run full backbone with action queries appended, return queries' hidden states.
+        """Run language_model with action queries appended, with explicit positions and masks.
 
-        This is the exact full-recompute analogue of `decode_action_queries`: the
-        queries are appended to the prefix embeddings, attend to all prior text
-        and all visual frames through all 24 layers, and produce post-final-norm
-        states for the action MLP.
+        This is the exact full-recompute analogue of `decode_action_queries`:
+        1. Encodes vision features once via vision encoder.
+        2. Computes 3D MRoPE position_ids for text tokens and assigns queries
+           consecutive positions starting at `next_text_position`.
+        3. Constructs a cross_attention_mask where action queries have full visibility
+           into all historical visual frames (with padding tail masked out).
+        4. Calls language_model directly, bypassing any top-level wrapper assumptions.
         """
         values = dict(moss_inputs)
-        values.pop("labels", None)
-        values["use_cache"] = False
         batch, queries, width = query_embeds.shape
+        input_ids = values.get("input_ids")
+        pixel_values = values.get("pixel_values")
+        grid_thw = values.get("grid_thw")
+        media_nums_per_sample = values.get("media_nums_per_sample")
 
+        if input_ids is not None and pixel_values is not None and grid_thw is not None:
+            # Full multimodal path (standard training and parity)
+            config = self.moss.config
+            image_token_id = int(config.image_token_id)
+            merge_size = int(self.moss.visual.spatial_merge_size)
+
+            vision_method = getattr(self.moss, "get_vision_features_chunked", None)
+            if not callable(vision_method):
+                vision_method = self.moss.get_vision_features
+            vision_states, info = vision_method(
+                pixel_values, grid_thw, media_nums_per_sample
+            )
+            vision_states = vision_states.to(
+                device=input_ids.device,
+                dtype=self.moss.get_input_embeddings().weight.dtype,
+            )
+
+            text_pos, vis_pos, next_position = _realtime_mrope_positions(
+                input_ids, grid_thw, 0, image_token_id, merge_size
+            )
+            query_pos = (
+                next_position
+                + torch.arange(queries, device=input_ids.device)
+            ).view(1, 1, -1).expand(3, batch, -1)
+            full_text_pos = torch.cat((text_pos, query_pos), dim=-1)
+
+            prefix_embeds = self.moss.get_input_embeddings()(input_ids)
+            full_embeds = torch.cat(
+                (prefix_embeds, query_embeds.to(prefix_embeds)), dim=1
+            )
+
+            raw_attention = values.get("attention_mask")
+            if raw_attention is None:
+                raw_attention = torch.ones_like(input_ids)
+            query_attention = torch.ones(
+                batch, queries, dtype=raw_attention.dtype, device=raw_attention.device
+            )
+            full_attention = torch.cat((raw_attention, query_attention), dim=1)
+
+            frames_per_sample = (
+                max(media_nums_per_sample)
+                if media_nums_per_sample is not None
+                else int((input_ids == image_token_id).sum(dim=1).max().item())
+            )
+            visible_prefix = (input_ids == image_token_id).cumsum(dim=1).unsqueeze(-1) > torch.arange(
+                frames_per_sample, device=input_ids.device
+            )
+            # Action queries are causally after all frames, so they can see all frames.
+            visible_queries = torch.ones(
+                batch, queries, frames_per_sample, dtype=torch.bool, device=input_ids.device
+            )
+            full_visible = torch.cat((visible_prefix, visible_queries), dim=1)
+            cross_attention_mask = (~full_visible).unsqueeze(1)
+            cross_attention_mask = self.moss._expand_cross_attention_mask(
+                cross_attention_mask, info, target_dtype=vision_states.dtype
+            )
+            minimum = torch.finfo(cross_attention_mask.dtype).min
+            visible_rows = (cross_attention_mask != minimum).any(dim=-1).to(
+                cross_attention_mask.dtype
+            )[..., None]
+            cross_attention_mask = cross_attention_mask * visible_rows
+
+            call = {
+                "input_ids": None,
+                "inputs_embeds": full_embeds,
+                "attention_mask": full_attention,
+                "position_ids": full_text_pos,
+                "cross_attention_states": vision_states,
+                "vision_position_ids": vis_pos,
+                "cross_attention_mask": cross_attention_mask,
+                "full_text_row_masked_out_mask": visible_rows,
+                "use_cache": False,
+            }
+            output = self.moss.language_model(**call)
+            hidden = _layer_tensor(output)
+            return hidden[:, -queries:]
+
+        # Fallback for synthetic/text-only test stubs
         input_ids = values.pop("input_ids", None)
         inputs_embeds = values.pop("inputs_embeds", None)
         if inputs_embeds is None:
             if input_ids is None:
                 raise ValueError("backbone requires input_ids or inputs_embeds")
             inputs_embeds = self.moss.get_input_embeddings()(input_ids)
-
-        if inputs_embeds.shape[0] != batch:
-            raise ValueError("query batch size must match moss_inputs")
         full_embeds = torch.cat(
             (inputs_embeds, query_embeds.to(inputs_embeds)), dim=1
         )
-        values["inputs_embeds"] = full_embeds
-
         mask = values.get("attention_mask")
         if mask is not None:
             query_mask = torch.ones(
                 batch, queries, dtype=mask.dtype, device=mask.device
             )
             values["attention_mask"] = torch.cat((mask, query_mask), dim=1)
-
+        values["inputs_embeds"] = full_embeds
+        values["use_cache"] = False
         output = self.moss(**values)
         hidden = _layer_tensor(output)
         return hidden[:, -queries:]
@@ -546,15 +641,12 @@ class TruncatedMossBackbone(nn.Module):
             prefix_tokens + queries,
             device=query_embeds.device,
         )
-        # Queries share one XRoPE slot so their order is carried by the learned
-        # per-slot embedding rather than by position, and so the committed
-        # prefix keeps the exact positions a later frame will continue from.
-        position_ids = torch.full(
-            (3, 1, queries),
-            state.next_text_position,
-            dtype=torch.long,
-            device=query_embeds.device,
-        )
+        # Consecutive positions: p_j = next_text_position + j, exactly matching
+        # the training-time forward_with_queries path.
+        position_ids = (
+            state.next_text_position
+            + torch.arange(queries, device=query_embeds.device)
+        ).view(1, 1, -1).expand(3, 1, -1)
         attention_mask = torch.cat(
             (
                 state.attention_mask,
@@ -655,14 +747,14 @@ class ActionQueryDecoder(nn.Module):
     def condition(
         self,
         robot_state: torch.Tensor,
-        state_difference: torch.Tensor,
+        state_velocity: torch.Tensor,
         visual_age: torch.Tensor,
     ) -> torch.Tensor:
         batch = robot_state.shape[0]
         if robot_state.shape != (batch, self.state_dim):
             raise ValueError(f"robot_state must have shape [batch, {self.state_dim}]")
-        if state_difference.shape != robot_state.shape:
-            raise ValueError("state_difference must align with robot_state")
+        if state_velocity.shape != robot_state.shape:
+            raise ValueError("state_velocity must align with robot_state")
         if visual_age.ndim == 0:
             visual_age = visual_age.expand(batch)
         if visual_age.shape != (batch,):
@@ -670,7 +762,7 @@ class ActionQueryDecoder(nn.Module):
         return torch.cat(
             (
                 robot_state,
-                state_difference,
+                state_velocity,
                 visual_age.unsqueeze(-1).to(robot_state) * self.delay_scale,
             ),
             dim=-1,
@@ -737,11 +829,10 @@ class MossActionVLA(nn.Module):
         self,
         moss_inputs: Mapping[str, Any],
         robot_state: torch.Tensor,
-        state_difference: torch.Tensor,
+        state_velocity: torch.Tensor,
         visual_age: torch.Tensor,
         *,
         query_delays: torch.Tensor | None = None,
-        action_token_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Full-recompute path: one planning time per sample.
 
@@ -754,7 +845,7 @@ class MossActionVLA(nn.Module):
         if query_delays is None:
             query_delays = self.default_query_delays(visual_age)
         condition = self.decoder.condition(
-            robot_state, state_difference, visual_age
+            robot_state, state_velocity, visual_age
         )
         queries = self.decoder.query_embeddings(condition, query_delays)
         needs_backbone_grad = any(
@@ -770,22 +861,38 @@ class MossActionVLA(nn.Module):
         self,
         moss_inputs: Mapping[str, Any],
         robot_state: torch.Tensor,
-        state_difference: torch.Tensor,
+        state_velocity: torch.Tensor,
         actions: torch.Tensor,
         visual_age: torch.Tensor,
         *,
         query_delays: torch.Tensor | None = None,
         valid_mask: torch.Tensor | None = None,
-        action_token_mask: torch.Tensor | None = None,
+        **_unused: Any,
     ) -> dict[str, torch.Tensor]:
         predicted = self.predict_chunk(
             moss_inputs,
             robot_state,
-            state_difference,
+            state_velocity,
             visual_age,
             query_delays=query_delays,
-            action_token_mask=action_token_mask,
         )
+        target = actions.to(predicted)
+        if target.shape != predicted.shape:
+            raise ValueError(
+                f"actions must have shape {tuple(predicted.shape)}, got {tuple(target.shape)}"
+            )
+        errors = (predicted - target).abs().mean(dim=-1)
+        if valid_mask is None:
+            loss = errors.mean()
+        else:
+            weights = valid_mask.to(errors)
+            if weights.shape != errors.shape:
+                raise ValueError("valid_mask must align with the action chunk")
+            total = weights.sum()
+            if not bool(total > 0):
+                raise ValueError("every planning time needs at least one valid action")
+            loss = (errors * weights).sum() / total
+        return {"loss": loss, "predicted_actions": predicted}
         target = actions.to(predicted)
         if target.shape != predicted.shape:
             raise ValueError(
@@ -853,6 +960,7 @@ class StreamingMossActionSession:
         self.last_timestamp: float | None = None
         self.last_frame_timestamp: float | None = None
         self._lock = threading.Lock()
+        self.plan_latency_ema: float = 0.05
 
     def _append_frame(
         self,
@@ -900,47 +1008,53 @@ class StreamingMossActionSession:
     def plan(
         self,
         robot_state: torch.Tensor,
-        state_difference: torch.Tensor,
+        state_velocity: torch.Tensor,
         *,
         plan_timestamp: float | None = None,
-        inference_latency: float = 0.0,
+        inference_latency: float | None = None,
         clamp: bool = True,
     ) -> ActionChunk:
         """Decode one micro-chunk from the committed prefix, then drop the queries."""
         with self._lock:
             if self.last_frame_timestamp is None:
                 raise RuntimeError("a frame must be appended before planning")
+            call_start = time.monotonic()
             plan_timestamp = (
-                time.monotonic() if plan_timestamp is None else float(plan_timestamp)
+                call_start if plan_timestamp is None else float(plan_timestamp)
             )
             if not math.isfinite(plan_timestamp):
                 raise ValueError("plan timestamp must be finite")
             visual_age = max(0.0, plan_timestamp - self.last_frame_timestamp)
+            # Use tracked EMA latency if no explicit latency override was provided
+            latency = self.plan_latency_ema if inference_latency is None else float(inference_latency)
             device = next(self.policy.parameters()).device
             dtype = self.policy.decoder.query_embedding.dtype
             robot_state = robot_state.to(device=device, dtype=dtype)
-            state_difference = state_difference.to(device=device, dtype=dtype)
+            state_velocity = state_velocity.to(device=device, dtype=dtype)
             if robot_state.ndim == 1:
                 robot_state = robot_state.unsqueeze(0)
-            if state_difference.ndim == 1:
-                state_difference = state_difference.unsqueeze(0)
+            if state_velocity.ndim == 1:
+                state_velocity = state_velocity.unsqueeze(0)
             if robot_state.shape[0] != 1:
                 raise ValueError("a streaming session plans for one robot at a time")
             age = torch.full((1,), visual_age, device=device, dtype=dtype)
             delays = self.policy.default_query_delays(
-                age, inference_latency=inference_latency
+                age, inference_latency=latency
             )
             condition = self.policy.decoder.condition(
-                robot_state, state_difference, age
+                robot_state, state_velocity, age
             )
             queries = self.policy.decoder.query_embeddings(condition, delays)
             hidden = self.policy.backbone.decode_action_queries(self.state, queries)
             actions = self.policy.decoder(hidden)
             if clamp:
                 actions = actions.clamp(-1.0, 1.0)
+            actual_latency = time.monotonic() - call_start
+            # Smooth EMA update
+            self.plan_latency_ema = 0.9 * self.plan_latency_ema + 0.1 * actual_latency
             return ActionChunk(
                 actions=actions[0],
-                start_time=plan_timestamp + inference_latency,
+                start_time=plan_timestamp + latency,
                 plan_time=plan_timestamp,
                 interval=self.policy.config.control_interval,
                 visual_age=visual_age,
@@ -951,17 +1065,17 @@ class StreamingMossActionSession:
         self,
         image: Any,
         robot_state: torch.Tensor,
-        state_difference: torch.Tensor,
+        state_velocity: torch.Tensor,
         *,
         timestamp: float | None = None,
         plan_timestamp: float | None = None,
-        inference_latency: float = 0.0,
+        inference_latency: float | None = None,
         clamp: bool = True,
     ) -> ActionChunk:
         self._append_frame(image, timestamp=timestamp)
         return self.plan(
             robot_state,
-            state_difference,
+            state_velocity,
             plan_timestamp=plan_timestamp
             if plan_timestamp is not None
             else self.last_frame_timestamp,

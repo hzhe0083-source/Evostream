@@ -259,6 +259,7 @@ def _pipeline_functions(
     history_timestamps: list[float] = []
     history_origin: float | None = None
     previous_state: np.ndarray | None = None
+    previous_time: float | None = None
 
     def encode(observation: Observation) -> float:
         nonlocal history_origin, stream
@@ -280,19 +281,19 @@ def _pipeline_functions(
             return observation.timestamp
 
     def plan(observation: Observation) -> dict[str, Any]:
-        nonlocal previous_state
+        nonlocal previous_state, previous_time
         current = observation.robot_state
-        difference = (
-            np.zeros_like(current)
-            if previous_state is None
-            else current - previous_state
-        )
-        previous_state = current
-        state = torch.from_numpy(current).to(device=device, dtype=dtype).unsqueeze(0)
-        delta = (
-            torch.from_numpy(difference).to(device=device, dtype=dtype).unsqueeze(0)
-        )
         started = time.monotonic()
+        if previous_state is None or previous_time is None:
+            velocity = np.zeros_like(current)
+        else:
+            dt = max(1e-4, started - previous_time)
+            velocity = (current - previous_state) / dt
+        previous_state = current.copy()
+        previous_time = started
+
+        state = torch.from_numpy(current).to(device=device, dtype=dtype).unsqueeze(0)
+        vel = torch.from_numpy(velocity).to(device=device, dtype=dtype).unsqueeze(0)
         with torch.inference_mode(), torch.autocast(
             device_type="cuda",
             dtype=dtype,
@@ -303,9 +304,9 @@ def _pipeline_functions(
                     raise RuntimeError("a frame must be encoded before planning")
                 chunk = stream.plan(
                     state,
-                    delta,
+                    vel,
                     plan_timestamp=started,
-                    inference_latency=action_delay_ms / 1000.0,
+                    inference_latency=action_delay_ms / 1000.0 if action_delay_ms else None,
                 )
                 actions = chunk.actions
                 visual_age = chunk.visual_age
@@ -324,13 +325,14 @@ def _pipeline_functions(
                     started - (history_origin + history_timestamps[-1]),
                 )
                 age = torch.full((1,), visual_age, device=device, dtype=dtype)
+                latency = action_delay_ms / 1000.0 if action_delay_ms else 0.05
                 actions = policy.predict_chunk(
                     moss_inputs,
                     state,
-                    delta,
+                    vel,
                     age,
                     query_delays=policy.default_query_delays(
-                        age, inference_latency=action_delay_ms / 1000.0
+                        age, inference_latency=latency
                     ),
                 )[0].clamp(-1.0, 1.0)
         result = actions.float().cpu().numpy()
@@ -521,6 +523,15 @@ def main() -> None:
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
     policy, processor, payload, device, dtype = _build_policy(args)
+
+    expected_interval = float(policy.config.control_interval)
+    actual_interval = 1.0 / float(args.control_hz)
+    if abs(actual_interval - expected_interval) > 1e-4:
+        raise ValueError(
+            f"control frequency mismatch: --control-hz {args.control_hz} corresponds to "
+            f"{actual_interval:.4f}s per step, but policy was trained with control_interval "
+            f"= {expected_interval:.4f}s. LIBERO evaluation requires --control-hz {1.0 / expected_interval:.1f}"
+        )
 
     from libero.libero import benchmark
     from libero.libero.envs import OffScreenRenderEnv

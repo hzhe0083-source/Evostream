@@ -1,30 +1,31 @@
 # MOSS-Action VLA
 
-MOSS-Action 保留 MOSS-VL 的完整视觉编码器和统一解码层 `0..23`，删除层 `24..47` 与语言输出头。指令只 prefill 一次；每个新帧单独编码并追加到 episode 级原生视觉 K/V cache，新的 frame-end control token 读取从开局到当前时刻的语言—视觉上下文。
+**MOSS-Action 将指令与增量视觉历史保存在持久多模态前缀中，每个规划周期从该前缀临时分叉出一组因果 Action Query，利用 MOSS 内部的文本 Self-Attention 与视觉 Cross-Attention 一次生成连续 micro-chunk，输出后立即回滚 Query KV，只保留干净的感知上下文供下一帧继续追加。**
 
-训练对视觉编码器、MOSS `0..23` 层和 Action Expert 做全参数更新。一个样本就是一个完整 episode，在所有 frame-end 同时监督动作；部署再把同一 causal forward 等价地改成增量 KV。动作侧采用 action-space Streaming Flow：持久 action state 是 Q，每个控制 tick 只积分一次 velocity、立刻输出一个动作；新画面在下一个动作边界更新条件，不再等待 `H50 × 7` 动作块完成 8 次去噪。
+保留 MOSS-VL 的完整视觉编码器和统一解码层 `0..23`，删除层 `24..47` 与语言输出头。指令只 prefill 一次；每个新帧单独编码并追加到 episode 级原生视觉 K/V cache，无需反复重编码历史画面。
+
+动作生成采用 **Streaming Action Query Decoder**：$K$ 个因果动作查询嵌入进入 24 层 MOSS 骨干网络，通过内部文本注意力读指令与状态速度条件，通过 6 层原生 Gated Cross-Attention 读增量视觉 KV，末端由轻量两层 MLP 直接回归 $K \times 7$ 连续动作块。生成完成后临时查询的 KV 被立即回滚截断，保证已执行的动作记忆不被未执行的旧未来污染。
 
 ## 已实现合同
 
-- 24 个保留层总计包含 18 个 Self-Attention 层和 6 个原生 Gated Cross-Attention 层；后者必须位于 `2,6,10,14,18,22`。
-- 训练把完整 episode 作为一条 causal sequence，并对视觉编码器、MOSS `0..23` 和 Action Expert 的全部参数反向传播；没有冻结或 LoRA 模式。部署时指令只 prefill 一次，新帧使用 MOSS 原生 `vision_cache_position` 追加，历史帧不重编码。
-- 每个 frame-end 都有一项稳定化条件 Flow Matching 损失：第 `t` 帧只读取 `frames[0:t]`，不会看到未来画面。未来 `H50` 动作只用于构造轨迹位置 `ξ(τ)` 与速度 `ξ̇(τ)`，不作为部署时反复生成的动作块。
-- 不切固定四帧窗口，也不把 episode 拆成短片段；`--frame-stride` 只控制原始帧采样密度。
-- 从最新 frame-end token 读取未经 final RMSNorm 的原始 `H14/H18/H23`，分别投影成三个动作 memory token。
-- 当前 action state、D9 机器人状态和 Flow time 组成动作 Q；Action Expert 对三个 memory token 执行 Cross-Attention 和 FFN，直接预测当前 action-space velocity。
-- 部署拆成独立的 MOSS perception worker 与 Streaming Action Flow worker：感知流异步刷新 memory；动作流按控制频率持续生成，始终读取最新 memory 与最新 proprioception。
-- 动作从上一动作附近的窄高斯开始，训练目标为 `ξ̇(τ) - k(a-ξ(τ))`；稳定项将受新视觉条件影响而偏离的 action state 拉回当前示范轨迹。
-- 所有 MOSS 加载都设置 `local_files_only=True`；这些脚本不会下载模型权重。
+- 24 个保留层总计包含 18 个 Self-Attention 层和 6 个原生 Gated Cross-Attention 层；后者位于 `2, 6, 10, 14, 18, 22`。
+- 训练采用单个 planning time 样本，将增量帧序列、状态速度 $\dot{s}_t$ 与 $K$ 个 Action Query 一起送入 24 层前向并全参数反向传播；部署时指令与历史视觉以增量 KV 形式缓存，每次规划时以相同的因果注意力与跨注意力计算 Action Query，输出数值与全量前向对齐。
+- Action Query 具有 **Ephemeral 回滚保证**：每次规划完成后，`_ephemeral_cache` 只裁切 18 个 Self-Attention 层中的临时 Query 尾部，保留 6 个 Cross-Attention 层中的全部视觉 KV，感知上下文对后续帧零污染。
+- 采用 **Delay-Aware 训练**：每个样本随机采样实际视觉陈旧度（0 到 `max_visual_age_steps` 步）及仿真规划耗时 $L \sim U(10\text{ms}, 60\text{ms})$，前瞻构造每个 Query 的执行延迟 $d_j = \text{age}_v + L + j \Delta t$。
+- 状态输入统一使用物理时间归一化的状态速度 $\dot{s}_t = \frac{s_t - s_{t-1}}{\Delta t}$，消除不同规划频率下的数值尺度失配。
+- 动作 waypoint 以 10 Hz 生成（与 LIBERO 10 Hz 控制时序严格对齐）；闭环执行器支持朴素 Receding Horizon（暴露真实边界跳变）与可选的 ACT 式指数加权平滑（`--ensemble-lambda`）。
+- 部署使用 `Threading.Lock()` 互斥保护同一个流式 Session，彻底杜绝异步感知追加与规划回滚之间的竞态条件。
+- 所有 MOSS 加载都设置 `local_files_only=True`；这些脚本不会自动下载模型权重。
 
 ## 根目录入口
 
 ```text
-model.py          截断加载、增量 MOSS KV、Cross-Attention Streaming Flow Expert
-data.py           官方 LIBERO HDF5 → 完整 episode/per-frame state/H50/mask
-train.py          audit、单步 preflight、全参数流式训练
-evaluate.py       官方 fixed-init LIBERO blocking/async 闭环评测
-streaming.py      perception/action workers、视觉与动作最新值 mailbox
-test_contract.py  无权重单元测试、prefix parity、streaming two-frame parity
+model.py          截断加载、增量 MOSS KV、Ephemeral Action Query、轻量 MLP 头
+data.py           官方 LIBERO HDF5 → 单 planning-time / delay-aware / state_velocity
+train.py          audit、单步 preflight、全参数 Action Query 训练
+evaluate.py       官方 fixed-init LIBERO blocking/async 闭环评测与边界抖动度量
+streaming.py      异步 perception worker、chunk planner、chunk executor
+test_contract.py  无权重单元测试、Action Query Parity、路径 A/B 回滚不变性测试
 ```
 
 原始 MOSS-VL 代码、推理、微调、SGLang 和 Flash-Attention 文件也都位于本仓库根目录。原始说明保存在 [docs/MOSS_VL_UPSTREAM.md](docs/MOSS_VL_UPSTREAM.md) 和 [docs/MOSS_VL_UPSTREAM_zh.md](docs/MOSS_VL_UPSTREAM_zh.md)。

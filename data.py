@@ -252,10 +252,19 @@ class LiberoHDF5Dataset(Dataset):
             np.stack((current_row, previous_row)), self.state_low, self.state_high
         )
         visual_age = float(age_steps * self.frame_interval)
+        # Sample realistic planning latency L ~ U(10ms, 60ms) to train delay-aware readiness
+        simulated_latency = float(
+            np.random.default_rng((self.seed + 1, index)).uniform(0.01, 0.06)
+        )
         query_delays = (
             visual_age
+            + simulated_latency
             + np.arange(self.chunk_size, dtype=np.float32) * self.frame_interval
         )
+        # Normalize state difference into physical velocity (per-second change)
+        state_velocity = (
+            (normalized[0] - normalized[1]) / self.frame_interval
+        ).astype(np.float32)
         return {
             "stream_id": (str(ref.path), ref.demo),
             "planning_time": planning_time,
@@ -264,7 +273,7 @@ class LiberoHDF5Dataset(Dataset):
             * self.frame_interval,
             "instruction": ref.instruction,
             "robot_state": normalized[0],
-            "state_difference": (normalized[0] - normalized[1]).astype(np.float32),
+            "state_velocity": state_velocity,
             "visual_age": np.float32(visual_age),
             "query_delays": query_delays.astype(np.float32),
             "actions": chunk,
@@ -387,19 +396,13 @@ class MossActionCollator:
             raise ValueError(
                 f"frame-end tokens do not align with stream frames: {actual} != {expected}"
             )
-        # Exactly one readout per sample: the newest frame at this planning time.
-        action_token_mask = torch.zeros_like(frame_token_mask)
-        for sample in range(len(rows)):
-            positions = frame_token_mask[sample].nonzero(as_tuple=True)[0]
-            action_token_mask[sample, positions[-1]] = True
         return {
             "moss_inputs": moss_inputs,
-            "action_token_mask": action_token_mask,
             "robot_state": torch.from_numpy(
                 np.stack([row["robot_state"] for row in rows])
             ),
-            "state_difference": torch.from_numpy(
-                np.stack([row["state_difference"] for row in rows])
+            "state_velocity": torch.from_numpy(
+                np.stack([row["state_velocity"] for row in rows])
             ),
             "visual_age": torch.from_numpy(
                 np.asarray([row["visual_age"] for row in rows], dtype=np.float32)

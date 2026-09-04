@@ -1,4 +1,4 @@
-"""Continuous MOSS perception and action-space Flow workers."""
+"""Asynchronous MOSS visual streaming and action-chunk planning workers."""
 
 from __future__ import annotations
 
