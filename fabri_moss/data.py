@@ -28,6 +28,7 @@ def partition_episode_consume_chunks(
     window: int,
     min_context_frames: int,
     rng: random.Random,
+    decision_stride: Optional[int] = None,
 ) -> List[List[int]]:
     if ep_len <= 0:
         raise ValueError(f"ep_len must be positive, got {ep_len}")
@@ -39,8 +40,13 @@ def partition_episode_consume_chunks(
         raise ValueError(f"min_context_frames ({min_context_frames}) cannot exceed window ({window})")
     if frame_stride < 1:
         raise ValueError(f"frame_stride must be >= 1, got {frame_stride}")
+    if decision_stride is not None and (type(decision_stride) is not int or decision_stride < 1):
+        raise ValueError("decision_stride must be a positive integer or None")
 
-    sampled_rows = list(range(0, ep_len, frame_stride))
+    # Legacy consume samples every ``frame_stride``.  Cadence mode keeps every
+    # observed row in the chunk; the caller selects decision targets separately
+    # using the episode-global decision stride.
+    sampled_rows = list(range(ep_len)) if decision_stride is not None else list(range(0, ep_len, frame_stride))
     chunks: List[List[int]] = []
     i = 0
     n = len(sampled_rows)
@@ -235,6 +241,8 @@ class MetaWorldWindows(Dataset):
         max_episodes: Optional[int] = None,
         context_mode: str = "window",
         min_context_frames: int = 1,
+        decision_stride: Optional[int] = None,
+        execution_horizon: int = 5,
     ):
         if context_mode not in ("window", "consume", "causal"):
             raise ValueError(f"context_mode must be 'window', 'consume' or 'causal', got '{context_mode}'")
@@ -244,6 +252,10 @@ class MetaWorldWindows(Dataset):
             raise ValueError(f"min_context_frames ({min_context_frames}) cannot exceed window ({window})")
         if min(horizon, state_dim, action_dim, frame_stride) < 1 or (max_episodes is not None and max_episodes < 1):
             raise ValueError("Window, stride, horizon, dimensions and episode limit must be positive")
+        if decision_stride is not None and (type(decision_stride) is not int or decision_stride < 1):
+            raise ValueError("decision_stride must be a positive integer or None")
+        if type(execution_horizon) is not int or execution_horizon < 1:
+            raise ValueError("execution_horizon must be a positive integer")
         self.root = Path(root).resolve()
         if not self.root.exists():
             raise FileNotFoundError(f"Dataset root does not exist: {self.root}")
@@ -269,6 +281,8 @@ class MetaWorldWindows(Dataset):
         self.max_episodes = max_episodes
         self.context_mode = context_mode
         self.min_context_frames = min_context_frames
+        self.decision_stride = decision_stride
+        self.execution_horizon = execution_horizon
 
         self.parquet_cache = BoundedParquetCache(capacity=2)
         self.frame_cache = BoundedFrameCache(capacity=1)
@@ -297,6 +311,9 @@ class MetaWorldWindows(Dataset):
                 if ep_len <= 0:
                     raise ValueError(f"Episode {ep.get('episode_index')} has invalid length {ep_len}")
                 for row in range(ep_len):
+                    # Cadence mode keeps the legacy per-row index geometry for
+                    # window callers; non-decision rows are represented as
+                    # empty-target samples and can be skipped by the trainer.
                     self.anchors.append((ep, row))
         else:
             for ep in self.active_episodes:
@@ -311,6 +328,7 @@ class MetaWorldWindows(Dataset):
                     window=self.window,
                     min_context_frames=self.min_context_frames,
                     rng=ep_rng,
+                    decision_stride=self.decision_stride,
                 )
                 for chunk in chunks:
                     # consume supervises only the final row for backwards
@@ -335,6 +353,8 @@ class MetaWorldWindows(Dataset):
             "anchors": [(int(ep["episode_index"]), int(row)) for ep, row in self.anchors],
             "consume_histories": self._consume_histories,
             "causal_chunks": self._causal_chunks,
+            "decision_stride": self.decision_stride,
+            "execution_horizon": self.execution_horizon,
         }
         self.partition_fingerprint = hashlib.sha256(
             json.dumps(partition_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -480,8 +500,13 @@ class MetaWorldWindows(Dataset):
         ep_idx = int(ep["episode_index"])
         df = self._get_episode_dataframe(ep)
         ep_len = len(df)
+        decision_stride = getattr(self, "decision_stride", None)
+        execution_horizon = getattr(self, "execution_horizon", 5)
 
         curr_row = df.iloc[row_idx]
+
+        def is_decision_row(row: int) -> bool:
+            return decision_stride is None or int(df.iloc[row]["frame_index"]) % decision_stride == 0
 
         raw_task_idx = curr_row["task_index"]
         if raw_task_idx is None or (isinstance(raw_task_idx, float) and np.isnan(raw_task_idx)):
@@ -495,17 +520,26 @@ class MetaWorldWindows(Dataset):
 
         if self.context_mode == "consume":
             history_rows = list(self._consume_histories[idx])
-            target_rows = [row_idx]
+            if decision_stride is None:
+                target_rows = [row_idx]
+            else:
+                target_rows = [r for r in history_rows if is_decision_row(r)]
         elif self.context_mode == "causal":
             history_rows = list(self._causal_chunks[idx])
-            target_rows = list(history_rows)
+            if decision_stride is None:
+                target_rows = list(history_rows)
+            else:
+                # Decisions are tied to episode-global rows.  Keep chunks with
+                # no phase-zero target so their observed frames remain part of
+                # the stream; callers may skip their empty supervision.
+                target_rows = [r for r in history_rows if is_decision_row(r)]
         else:
             history_rows = compute_history_row_indices(
                 current_row=row_idx,
                 window=self.window,
                 stride=self.frame_stride,
             )
-            target_rows = [row_idx]
+            target_rows = [row_idx] if is_decision_row(row_idx) else []
 
         video_path = self._locate_video_path(ep_idx)
         images_window = []
@@ -564,6 +598,9 @@ class MetaWorldWindows(Dataset):
         state_masks = []
         action_values = []
         action_masks = []
+        action_time_masks = []
+        action_time_weights = []
+        valid_action_lengths: List[int] = []
         for target_row in target_rows:
             raw_state = df.iloc[target_row]["observation.state"]
             if raw_state is None:
@@ -578,6 +615,7 @@ class MetaWorldWindows(Dataset):
             action_rows = df.iloc[target_row:end_row]["action"].tolist()
             if len(action_rows) == 0:
                 raise ValueError(f"Episode {ep_idx} row {target_row} has 0 action rows")
+            valid_len = len(action_rows)
             while len(action_rows) < self.horizon:
                 action_rows.append(action_rows[-1])
             actions_norm, action_mask = normalize_and_mask(
@@ -586,15 +624,38 @@ class MetaWorldWindows(Dataset):
                 max_val=self.action_maxs,
                 target_dim=self.action_dim,
             )
+            # Repeat-last values are useful for a fixed-shape head but are not
+            # real labels.  Keep their time positions explicitly masked out.
+            if valid_len < self.horizon:
+                action_mask[valid_len:, :] = 0.0
+            action_time_mask = np.zeros((self.horizon,), dtype=np.float32)
+            action_time_mask[:valid_len] = 1.0
+            action_time_weight = np.ones((self.horizon,), dtype=np.float32)
+            action_time_weight[: min(execution_horizon, self.horizon)] = 4.0
             state_values.append(state_norm)
             state_masks.append(state_mask)
             action_values.append(actions_norm)
             action_masks.append(action_mask)
+            action_time_masks.append(action_time_mask)
+            action_time_weights.append(action_time_weight)
+            valid_action_lengths.append(valid_len)
 
-        state_tensor = torch.from_numpy(np.stack(state_values, axis=0))
-        state_mask_tensor = torch.from_numpy(np.stack(state_masks, axis=0))
-        actions_tensor = torch.from_numpy(np.stack(action_values, axis=0))
-        action_mask_tensor = torch.from_numpy(np.stack(action_masks, axis=0))
+        # Empty-target cadence chunks are valid observations.  Preserve their
+        # fixed trailing dimensions so generic collators can still inspect them.
+        if target_rows:
+            state_tensor = torch.from_numpy(np.stack(state_values, axis=0))
+            state_mask_tensor = torch.from_numpy(np.stack(state_masks, axis=0))
+            actions_tensor = torch.from_numpy(np.stack(action_values, axis=0))
+            action_mask_tensor = torch.from_numpy(np.stack(action_masks, axis=0))
+            action_time_mask_tensor = torch.from_numpy(np.stack(action_time_masks, axis=0))
+            action_time_weights_tensor = torch.from_numpy(np.stack(action_time_weights, axis=0))
+        else:
+            state_tensor = torch.empty((0, self.state_dim), dtype=torch.float32)
+            state_mask_tensor = torch.empty((0, self.state_dim), dtype=torch.float32)
+            actions_tensor = torch.empty((0, self.horizon, self.action_dim), dtype=torch.float32)
+            action_mask_tensor = torch.empty((0, self.horizon, self.action_dim), dtype=torch.float32)
+            action_time_mask_tensor = torch.empty((0, self.horizon), dtype=torch.float32)
+            action_time_weights_tensor = torch.empty((0, self.horizon), dtype=torch.float32)
 
         context_start = int(df.iloc[history_rows[0]]["frame_index"])
         context_end = int(df.iloc[history_rows[-1]]["frame_index"])
@@ -608,6 +669,10 @@ class MetaWorldWindows(Dataset):
             "state_mask": state_mask_tensor,
             "actions": actions_tensor,
             "action_mask": action_mask_tensor,
+            "action_time_mask": action_time_mask_tensor,
+            "action_time_weights": action_time_weights_tensor,
+            "valid_action_lengths": valid_action_lengths,
+            "execution_horizon": execution_horizon,
             "raw_dim": self.raw_dim,
             "context_mode": self.context_mode,
             "context_start": context_start,
@@ -615,8 +680,11 @@ class MetaWorldWindows(Dataset):
         }
         if observation_times is not None:
             ret["observation_times"] = observation_times
-        if time_source is not None:
+        if time_source is not None or decision_stride is not None:
             ret["time_source"] = time_source
+        # Keep the field explicit so checkpoints can distinguish legacy
+        # sampling (None) from cadence sampling without inspecting arguments.
+        ret["decision_stride"] = decision_stride
         if self.context_mode == "causal":
             target_indices = [history_rows.index(r) for r in target_rows]
             visible_counts = [i + 1 for i in target_indices]
@@ -633,6 +701,23 @@ class MetaWorldWindows(Dataset):
                     for pos, i in enumerate(target_indices)
                 ],
             })
+        elif decision_stride is not None:
+            # Keep the same target/visibility contract available to cadence
+            # callers in legacy window/consume modes.
+            target_indices = [history_rows.index(r) for r in target_rows]
+            visible_counts = [i + 1 for i in target_indices]
+            ret.update({
+                "target_rows": list(target_rows),
+                "target_indices": target_indices,
+                "target_frame_ids": [frame_ids[i] for i in target_indices],
+                "target_count": len(target_indices),
+                "visible_counts": visible_counts,
+                "visible_frame_counts": visible_counts,
+                "replay_groups": [
+                    {"observation_indices": list(range(i + 1)), "target_positions": [pos]}
+                    for pos, i in enumerate(target_indices)
+                ],
+            })
         return ret
 
     def get_data_contract(self) -> Dict[str, Any]:
@@ -640,6 +725,9 @@ class MetaWorldWindows(Dataset):
         active_ids = [int(ep["episode_index"]) for ep in self.active_episodes]
         metadata_sha256 = getattr(self, "metadata_sha256", {})
         partition_fingerprint = getattr(self, "partition_fingerprint", "")
+        decision_stride = getattr(self, "decision_stride", None)
+        execution_horizon = getattr(self, "execution_horizon", 5)
+        time_source = self._contract_time_source()
         fingerprint_raw = json.dumps({
             "root": str(self.root),
             "meta_info": meta_info,
@@ -649,6 +737,10 @@ class MetaWorldWindows(Dataset):
             "horizon": self.horizon,
             "state_dim": self.state_dim,
             "action_dim": self.action_dim,
+            "decision_stride": decision_stride,
+            "execution_horizon": execution_horizon,
+            "action_time_weighting": "execution=4.0,remaining=1.0",
+            "time_source": time_source,
         }, sort_keys=True, separators=(",", ":"))
         data_fingerprint = hashlib.sha256(fingerprint_raw.encode("utf-8")).hexdigest()
         return {
@@ -665,6 +757,39 @@ class MetaWorldWindows(Dataset):
             "horizon": self.horizon,
             "state_dim": self.state_dim,
             "action_dim": self.action_dim,
+            "decision_stride": decision_stride,
+            "execution_horizon": execution_horizon,
+            "valid_action_lengths": "per_target:min(horizon, episode_length-target_row); repeat_last_tail_masked",
+            "action_time_weights": "4.0x first execution_horizon steps, 1.0x remaining steps",
+            "time_source": time_source,
+            "time_source_policy": "per_sample:parquet_timestamp>metadata_fps>none",
             "partition_fingerprint": partition_fingerprint,
             "data_fingerprint": data_fingerprint,
         }
+
+    def _contract_time_source(self) -> Optional[str]:
+        """Resolve the observed timestamp source for the contract when cheap.
+
+        Timestamp provenance is per episode.  A first-episode probe keeps the
+        contract useful for homogeneous datasets while avoiding a full parquet
+        scan; mixed or unavailable metadata is reported explicitly.
+        """
+        episodes = getattr(self, "active_episodes", ())
+        info = getattr(self, "info", {})
+        if not episodes:
+            return "metadata_fps" if info.get("fps") is not None else None
+        sources = set()
+        for ep in episodes[:1]:
+            try:
+                df = self._get_episode_dataframe(ep)
+            except (ImportError, FileNotFoundError, KeyError, ValueError, AttributeError):
+                break
+            if "timestamp" in df.columns:
+                sources.add("parquet_timestamp")
+            elif info.get("fps") is not None:
+                sources.add("metadata_fps")
+            else:
+                sources.add(None)
+        if not sources:
+            return "metadata_fps" if info.get("fps") is not None else None
+        return next(iter(sources)) if len(sources) == 1 else "mixed"

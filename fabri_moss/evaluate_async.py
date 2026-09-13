@@ -14,9 +14,13 @@ from __future__ import annotations
 import argparse
 import copy
 import dataclasses
+from contextlib import contextmanager
+import hashlib
+import importlib.metadata
 import json
 import logging
 import math
+import os
 from pathlib import Path
 import random
 import sys
@@ -37,9 +41,303 @@ from fabri_moss.async_pipeline import (
     make_moss_callbacks,
 )
 from fabri_moss.native_async import make_native_cache_callbacks, validate_native_memory
-from fabri_moss.core import MossConfig, MossInternVL
+from fabri_moss.core import MOSS_ARCHITECTURE_REVISION, MossConfig, MossInternVL
 from fabri_moss.data import normalize_and_mask
 from fabri_moss.runtime import assert_native_fa2, load_native_checkpoint
+
+
+# Keep these values in one place so every evaluation entrypoint can state its
+# scope without accidentally calling a short smoke run an official benchmark.
+OFFICIAL_MT50_TASK_COUNT = 50
+OFFICIAL_MT50_EPISODES_PER_TASK = 10
+OFFICIAL_MT50_PLANNED_EPISODES = 500
+OFFICIAL_EPISODE_HORIZON = 400
+OFFICIAL_EXEC_HORIZON = 5
+OFFICIAL_FLOW_STEPS = 50
+OFFICIAL_CAMERA_NAME = "corner2"
+OFFICIAL_IMAGE_SIZE = 448
+MOSS_TRAINER_ARCHITECTURE_REVISION = "moss-cross-qkvo-lora-fp32-r8-a16-d0.1-v1"
+
+
+def compute_file_sha256(path: str | Path, block_size: int = 1024 * 1024) -> str:
+    """Return a streaming SHA-256 digest for a provenance-bearing file."""
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for block in iter(lambda: handle.read(block_size), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+# Short alias used by standalone evaluation scripts.
+sha256_file = compute_file_sha256
+compute_sha256 = compute_file_sha256
+
+
+def derive_plan_seed(
+    master_seed: int,
+    task_slug: str,
+    episode_index: int,
+    source_frame_id: Optional[int] = None,
+    *,
+    plan_index: Optional[int] = None,
+) -> int:
+    """Derive a stable diffusion seed for one task/episode/plan identity.
+
+    The JSON encoding is intentionally part of the contract: it makes the
+    same plan reproducible even when another task finishes early or consumes
+    unrelated random numbers.
+    """
+    if type(master_seed) is not int:
+        raise ValueError("master_seed must be an integer")
+    if not isinstance(task_slug, str) or not task_slug.strip():
+        raise ValueError("task_slug must be a non-empty string")
+    if type(episode_index) is not int or episode_index < 0:
+        raise ValueError("episode_index must be a non-negative integer")
+    if source_frame_id is None:
+        source_frame_id = plan_index
+    if type(source_frame_id) is not int or source_frame_id < 0:
+        raise ValueError("source_frame_id/plan_index must be a non-negative integer")
+    task_slug = task_slug.strip()
+    identity = json.dumps(
+        [master_seed, task_slug, episode_index, source_frame_id],
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("utf-8")
+    return int.from_bytes(hashlib.sha256(identity).digest()[:8], "big") % (2**63)
+
+
+# Backward/forward-compatible spelling used by a few standalone replay tools.
+derive_diffusion_seed = derive_plan_seed
+
+
+def _seed_selected_torch_device(seed: int, device: Optional[Union[str, torch.device]]) -> None:
+    """Seed CPU and only the selected CUDA device."""
+    torch.random.default_generator.manual_seed(int(seed))
+    if device is None:
+        return
+    target = torch.device(device)
+    if target.type == "cuda" and torch.cuda.is_available():
+        with torch.cuda.device(target):
+            torch.cuda.manual_seed(int(seed))
+
+
+@contextmanager
+def fixed_diffusion_seed(
+    seed: Optional[int],
+    device: Optional[Union[str, torch.device]] = None,
+):
+    """Temporarily seed flow sampling and restore the caller RNG state.
+
+    ``seed=None`` leaves the existing stream untouched.  CUDA state is scoped
+    to the selected device, which keeps paired runs independent on multi-GPU
+    hosts.
+    """
+    if seed is None:
+        yield
+        return
+    target = torch.device(device) if device is not None else torch.device("cpu")
+    cuda_devices: List[int] = []
+    if target.type == "cuda" and torch.cuda.is_available():
+        cuda_devices = [target.index if target.index is not None else torch.cuda.current_device()]
+    with torch.random.fork_rng(devices=cuda_devices, enabled=True):
+        _seed_selected_torch_device(int(seed), target)
+        yield
+
+
+def describe_fa2_runtime() -> Dict[str, Any]:
+    """Describe the installed FA2 package without making CPU imports fail."""
+    configured_paths = [p for p in os.environ.get("PYTHONPATH", "").split(os.pathsep) if p]
+    explicit_paths: List[str] = []
+    for env_key in ("FA2_PKG_PATH", "FLASH_ATTENTION_PATH"):
+        env_path = os.environ.get(env_key)
+        if env_path:
+            explicit_paths.extend(p for p in env_path.split(os.pathsep) if p)
+    configured_paths = [p for p in configured_paths if "fa2" in p.lower() or "flash" in p.lower() or "python_packages" in p]
+    configured_paths.extend(explicit_paths)
+    configured_paths = list(dict.fromkeys(str(Path(p).resolve()) for p in configured_paths))
+    info: Dict[str, Any] = {
+        "configured_paths": configured_paths,
+        "package": "flash-attn",
+        "version": None,
+        "module_path": None,
+        "native_fa2_verified": False,
+    }
+    try:
+        info["version"] = importlib.metadata.version("flash-attn")
+    except importlib.metadata.PackageNotFoundError:
+        try:
+            info["version"] = importlib.metadata.version("flash_attn")
+        except importlib.metadata.PackageNotFoundError:
+            pass
+    if info["version"] is None:
+        # The calibrated server wheel is often injected through a plain
+        # PYTHONPATH directory without a distribution visible to metadata.
+        for root in configured_paths:
+            try:
+                for metadata_file in Path(root).glob("flash_attn*.dist-info/METADATA"):
+                    for line in metadata_file.read_text(encoding="utf-8", errors="replace").splitlines():
+                        if line.lower().startswith("version:"):
+                            info["version"] = line.split(":", 1)[1].strip()
+                            break
+                    if info["version"]:
+                        break
+            except OSError:
+                continue
+            if info["version"]:
+                break
+    try:
+        import flash_attn  # type: ignore
+
+        info["module_path"] = str(Path(flash_attn.__file__).resolve()) if getattr(flash_attn, "__file__", None) else None
+        if info["version"] is None:
+            info["version"] = getattr(flash_attn, "__version__", None)
+    except Exception as exc:  # CPU mechanism tests commonly have no FA2 wheel.
+        info["import_error"] = type(exc).__name__
+    # Flat aliases make JSON inspection convenient while retaining the nested
+    # package record for machine consumers.
+    info["fa2_version"] = info.get("version")
+    info["fa2_path"] = info.get("module_path") or (configured_paths[0] if configured_paths else None)
+    info["package_path"] = info["fa2_path"]
+    info["configured_path"] = configured_paths[0] if configured_paths else None
+    return info
+
+
+get_fa2_provenance = describe_fa2_runtime
+
+
+def official_mt50_contract(
+    *,
+    task_count: int,
+    episodes_per_task: int,
+    episode_horizon: int,
+    exec_horizon: int,
+    flow_steps: int,
+    observation_stride: int = 1,
+    camera_name: str = OFFICIAL_CAMERA_NAME,
+    image_size: int = OFFICIAL_IMAGE_SIZE,
+    completed_episodes: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Return explicit scope labels for an MT50 or partial evaluation."""
+    for name, value in (
+        ("task_count", task_count),
+        ("episodes_per_task", episodes_per_task),
+        ("episode_horizon", episode_horizon),
+        ("exec_horizon", exec_horizon),
+        ("flow_steps", flow_steps),
+        ("observation_stride", observation_stride),
+        ("image_size", image_size),
+    ):
+        if type(value) is not int or value <= 0:
+            raise ValueError(f"{name} must be a positive integer")
+    if completed_episodes is not None and (type(completed_episodes) is not int or completed_episodes < 0):
+        raise ValueError("completed_episodes must be a non-negative integer")
+    configured = (
+        task_count == OFFICIAL_MT50_TASK_COUNT
+        and episodes_per_task == OFFICIAL_MT50_EPISODES_PER_TASK
+        and episode_horizon == OFFICIAL_EPISODE_HORIZON
+        and exec_horizon == OFFICIAL_EXEC_HORIZON
+        and flow_steps == OFFICIAL_FLOW_STEPS
+        and observation_stride == 1
+        and camera_name == OFFICIAL_CAMERA_NAME
+        and image_size == OFFICIAL_IMAGE_SIZE
+    )
+    planned = int(task_count) * int(episodes_per_task)
+    completed = planned if completed_episodes is None else int(completed_episodes)
+    complete = configured and planned == OFFICIAL_MT50_PLANNED_EPISODES and completed == planned
+    return {
+        "scope": "mt50" if task_count == OFFICIAL_MT50_TASK_COUNT else "single_task_or_partial",
+        "scope_label": "mt50_500" if complete else ("mt50_partial" if task_count == OFFICIAL_MT50_TASK_COUNT else "single_task_or_partial"),
+        "task_count": int(task_count),
+        "episodes_per_task": int(episodes_per_task),
+        "planned_episodes": planned,
+        "completed_episodes": completed,
+        "episode_horizon": int(episode_horizon),
+        "exec_horizon": int(exec_horizon),
+        "flow_steps": int(flow_steps),
+        "camera_name": camera_name,
+        "image_size": int(image_size),
+        "configured_official_mt50": bool(configured),
+        "official_mt50_500": bool(complete),
+        "configured_full_mt50": bool(configured),
+        "is_full_mt50_benchmark": bool(complete),
+        "success_comparable_to_native_sota": False,
+    }
+
+
+def is_official_mt50(**kwargs: Any) -> bool:
+    """Small predicate for launchers/tests that only need the scope bit."""
+    return bool(official_mt50_contract(**kwargs)["official_mt50_500"])
+
+
+def make_official_mt50_env(seed: int = 4048) -> Any:
+    """Lazily construct the official synchronous MetaWorld MT50 vector env."""
+    try:
+        import metaworld  # noqa: F401
+        import gymnasium as gym
+    except ImportError as exc:
+        raise RuntimeError("metaworld and gymnasium are required for official MT50 evaluation") from exc
+    return gym.make_vec(
+        "Meta-World/MT50",
+        vector_strategy="sync",
+        seed=int(seed),
+        render_mode="rgb_array",
+        camera_name=OFFICIAL_CAMERA_NAME,
+    )
+
+
+make_mt50_vector_env = make_official_mt50_env
+
+
+def build_moss_provenance(
+    *,
+    checkpoint: str | Path,
+    adapter: str | Path,
+    architecture_contract: Dict[str, Any],
+    data_contract: Dict[str, Any],
+    native_fa2: Optional[Dict[str, Any]] = None,
+    source_files: Optional[Dict[str, str]] = None,
+) -> Dict[str, Any]:
+    """Build a common, honest provenance block for replay and MT50 outputs."""
+    checkpoint_path = Path(checkpoint).resolve()
+    adapter_path = Path(adapter).resolve()
+    native_diag = dict(native_fa2 or {})
+    fa2 = describe_fa2_runtime()
+    fa2["native_fa2_verified"] = bool(native_diag.get("native_fa2_enabled", False))
+    return {
+        "source_checkpoint": str(checkpoint_path),
+        "source_checkpoint_sha256": compute_file_sha256(checkpoint_path),
+        "adapter": str(adapter_path),
+        "adapter_sha256": compute_file_sha256(adapter_path),
+        "architecture_contract": dict(architecture_contract),
+        "data_contract": dict(data_contract),
+        "native_fa2": native_diag,
+        "fa2_package": fa2,
+        "source_files": dict(source_files or {}),
+        "time_source": data_contract.get("time_source"),
+    }
+
+
+def moss_architecture_contract(
+    *,
+    memory_mode: Optional[str] = None,
+    cross_layers: Optional[Sequence[int]] = None,
+    max_frames: Optional[int] = None,
+    architecture_revision: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Describe native FA2 and the separate MOSS SDPA branch explicitly."""
+    return {
+        "native_attention": "flash_attention_2 (asserted on CUDA)",
+        "moss_cross_attention": "torch.nn.functional.scaled_dot_product_attention (SDPA)",
+        "moss_cross_backend": "sdpa",
+        "moss_sdpa": True,
+        "moss_cross_is_native_fa2": False,
+        "full_model_fa2_claim": False,
+        "native_fa2_scope": "original_fabrivla_vit_and_language_layers_only",
+        "memory_mode": memory_mode,
+        "cross_layers": list(cross_layers) if cross_layers is not None else None,
+        "max_frames": max_frames,
+        "architecture_revision": architecture_revision,
+    }
 
 
 # ============================================================================
@@ -761,6 +1059,42 @@ def run_episode(
     finally:
         final_st = planner.stats()
 
+    # Normalize the per-plan/per-command ledger so downstream reports can
+    # consume one schema for sync, async, and paired replay outputs.
+    queue_drop_count = int(final_st.get("dropped_pending", 0)) + int(final_st.get("dropped_ready", 0))
+    for plan in plan_records:
+        ids = [int(v) for v in plan.get("snapshot_frame_ids", [])]
+        source = int(plan.get("source_frame_id", ids[-1] if ids else -1))
+        times = plan.get("snapshot_observation_times", [])
+        latest_time = times[-1] if times and times[-1] is not None else None
+        plan.setdefault("frame_ids", ids)
+        plan.setdefault("frame_offsets", [v - source for v in ids])
+        plan.setdefault("frame_ages", [
+            (float(latest_time) - float(t)) if latest_time is not None and t is not None else None
+            for t in times
+        ])
+        plan.setdefault("dropped_frame_ids", [])
+        plan.setdefault("drop_count", queue_drop_count)
+        plan.setdefault("fallback", False)
+    for command in command_log:
+        ids = [int(v) for v in command.get("snapshot_frame_ids", [])]
+        source = command.get("source_frame_id")
+        command.setdefault(
+            "frame_offsets",
+            [v - int(source) for v in ids] if ids and source is not None else [command.get("action_offset", -1)],
+        )
+        cmd_times = command.get("snapshot_observation_times", [])
+        cmd_latest = cmd_times[-1] if cmd_times and cmd_times[-1] is not None else None
+        command.setdefault(
+            "frame_ages",
+            [float(cmd_latest) - float(t) for t in cmd_times]
+            if cmd_latest is not None and all(t is not None for t in cmd_times)
+            else [],
+        )
+        command.setdefault("observation_age_sec", command.get("observation_age", None))
+        command.setdefault("drop_count", queue_drop_count)
+        command.setdefault("fallback", bool(command.get("is_fallback", False)))
+
     return {
         "episode_id": episode_id,
         "success": bool(success),
@@ -781,6 +1115,10 @@ def run_episode(
         "total_wait_time": float(np.sum(wait_durations)) if wait_durations else 0.0,
         "deadline_misses": deadline_misses,
         "realtime_zero_fallbacks": realtime_zero_fallbacks,
+        "fallback_count": realtime_zero_fallbacks,
+        "drop_count": queue_drop_count,
+        "memory_frame_count": final_st.get("memory_frame_count", 0),
+        "last_memory_frame_id": final_st.get("last_memory_frame_id", -1),
         "observation_ages": observation_ages,
         "plans": plan_records,
         "command_log": command_log,
@@ -930,6 +1268,10 @@ def main() -> None:
     use_timestamps = (args.timestamp_mode == "text") if args.mode == "native-cache" else False
 
     provenance: Dict[str, Any] = {
+        "evaluation_kind": "single_task_async_closed_loop",
+        "scope": "single_task_async",
+        "official_mt50_500": False,
+        "success_comparable_to_native_sota": False,
         "mode": args.mode,
         "control_mode": args.control_mode,
         "memory_mode": args.memory_mode if args.mode == "moss" else None,
@@ -956,7 +1298,26 @@ def main() -> None:
         "device": args.device,
         "control_hz": args.control_hz,
         "started_at": time.time(),
+        "architecture_contract": moss_architecture_contract(
+            memory_mode=args.memory_mode if args.mode == "moss" else None
+        ),
+        "data_contract": {
+            "camera_name": OFFICIAL_CAMERA_NAME,
+            "image_size": OFFICIAL_IMAGE_SIZE,
+            "episode_horizon": args.episode_horizon,
+            "exec_horizon": args.exec_horizon,
+            "flow_steps": args.num_inference_timesteps,
+            "time_source": "env.dt_or_step_index_fallback_for_legacy_async",
+        },
+        "fa2_package": describe_fa2_runtime(),
     }
+    checkpoint_path_for_meta = Path(args.checkpoint).resolve()
+    if checkpoint_path_for_meta.is_file():
+        provenance["source_checkpoint_sha256"] = compute_file_sha256(checkpoint_path_for_meta)
+    if args.adapter:
+        adapter_path_for_meta = Path(args.adapter).resolve()
+        if adapter_path_for_meta.is_file():
+            provenance["adapter_sha256"] = compute_file_sha256(adapter_path_for_meta)
 
     if args.control_mode == "step_wait":
         provenance["note"] = (
@@ -983,9 +1344,10 @@ def main() -> None:
         # used by the checkpoint/training contract.  Keep CPU functional tests
         # permissive, but fail fast instead of silently producing an eager
         # attention result that cannot be compared with the reference baseline.
-        if str(args.device).startswith("cuda"):
+        if torch.device(args.device).type == "cuda":
             fa2_diag = assert_native_fa2(policy)
             provenance["native_fa2_diagnostics"] = fa2_diag
+            provenance["fa2_package"]["native_fa2_verified"] = bool(fa2_diag.get("native_fa2_enabled", False))
             print(f"[evaluate_async] Native FA2 verified: {fa2_diag}", flush=True)
 
         if hasattr(policy, "action_head") and hasattr(policy.action_head, "config"):
@@ -997,19 +1359,47 @@ def main() -> None:
         stateful_planner: bool = False
         memory_validator_fn: Optional[Callable[..., Any]] = None
         if args.mode == "moss":
-            moss_config = MossConfig(max_frames=resolved_window, max_text_tokens=1024, memory_mode=args.memory_mode)
-            moss_model = MossInternVL(policy, config=moss_config)
-
-            # Set the requested stage before loading adapter weights.
-            moss_model.set_training_stage(args.adapter_stage)
-
             adapter_path = Path(args.adapter).resolve()
             if not adapter_path.exists():
                 raise FileNotFoundError(f"Adapter checkpoint not found: {adapter_path}")
 
             adapter_ckpt = torch.load(str(adapter_path), map_location="cpu", weights_only=False)
+            adapter_arch_revision = adapter_ckpt.get("architecture_revision") if isinstance(adapter_ckpt, dict) else None
+            if adapter_arch_revision is not None and adapter_arch_revision != MOSS_TRAINER_ARCHITECTURE_REVISION:
+                raise ValueError(
+                    f"MOSS adapter architecture_revision {adapter_arch_revision!r} != "
+                    f"{MOSS_TRAINER_ARCHITECTURE_REVISION!r}"
+                )
+            # v2 adapters carry the complete MOSS config (including the
+            # architecture revision).  Construct from that contract before
+            # comparing/loading weights so joint LoRA revisions cannot be
+            # mistaken for the legacy default config.
+            if adapter_ckpt.get("format") == "moss_cross_adapter_v2" and isinstance(adapter_ckpt.get("config"), dict):
+                moss_config = MossConfig(**dict(adapter_ckpt["config"]))
+                if getattr(moss_config, "architecture_revision", None) not in (
+                    MOSS_ARCHITECTURE_REVISION,
+                    MOSS_TRAINER_ARCHITECTURE_REVISION,
+                ):
+                    raise ValueError("MOSS config architecture_revision is unsupported")
+                if moss_config.memory_mode != args.memory_mode:
+                    raise ValueError(
+                        f"MOSS adapter memory_mode {moss_config.memory_mode!r} does not match requested {args.memory_mode!r}"
+                    )
+                if args.window is not None and moss_config.max_frames != args.window:
+                    raise ValueError(
+                        f"MOSS adapter max_frames {moss_config.max_frames!r} does not match requested window {args.window!r}"
+                    )
+                if moss_config.max_frames is not None:
+                    resolved_window = moss_config.max_frames
+            else:
+                moss_config = MossConfig(max_frames=resolved_window, max_text_tokens=1024, memory_mode=args.memory_mode)
+            moss_model = MossInternVL(policy, config=moss_config)
+
+            # Set the requested stage before loading adapter weights.
+            moss_model.set_training_stage(args.adapter_stage)
+
             if adapter_ckpt.get("format") == "moss_cross_adapter_v2":
-                if adapter_ckpt.get("source_checkpoint_sha256") != meta.get("checkpoint_sha256"):
+                if adapter_ckpt.get("source_checkpoint_sha256", adapter_ckpt.get("base_sha256")) != meta.get("checkpoint_sha256"):
                     raise ValueError("MOSS adapter source checkpoint SHA256 mismatch")
                 if adapter_ckpt.get("stage") != args.adapter_stage:
                     raise ValueError(
@@ -1023,9 +1413,31 @@ def main() -> None:
                 if args.adapter_stage in ("expert", "joint"):
                     moss_model.policy.action_head.load_state_dict(adapter_ckpt["action_head"], strict=True)
                 if args.adapter_stage == "joint":
-                    missing, unexpected = moss_model.policy.load_state_dict(adapter_ckpt["base_policy"], strict=False)
-                    if unexpected or any("action_head." not in k for k in missing):
-                        raise ValueError(f"invalid joint base_policy state: missing={missing}, unexpected={unexpected}")
+                    # New joint adapters carry a strict FP32 LoRA state and
+                    # do not duplicate the frozen native policy.
+                    from fabri_moss.lora import inject_lora, load_lora_state_dict, lora_spec
+
+                    spec = adapter_ckpt.get("lora_spec")
+                    lora_state = adapter_ckpt.get("lora_state")
+                    if not isinstance(spec, dict) or not isinstance(lora_state, dict):
+                        raise ValueError("joint MOSS adapter must contain lora_spec and lora_state")
+                    paths = []
+                    for layer_idx in moss_model.config.cross_layers:
+                        attention = moss_model.native_core.layers[int(layer_idx) - 1].self_attn
+                        prefix = next((n for n, m in moss_model.policy.named_modules() if m is attention), None)
+                        if not prefix:
+                            raise ValueError(f"native attention layer {layer_idx} is not reachable from policy")
+                        paths.extend(f"{prefix}.{name}" for name in ("q_proj", "k_proj", "v_proj", "o_proj"))
+                    inject_lora(
+                        moss_model.policy,
+                        paths,
+                        rank=int(spec.get("rank", 0)),
+                        alpha=float(spec.get("alpha", 0.0)),
+                        dropout=float(spec.get("dropout", 0.0)),
+                    )
+                    if lora_spec(moss_model.policy) != spec:
+                        raise ValueError("MOSS adapter LoRA architecture mismatch")
+                    load_lora_state_dict(moss_model.policy, lora_state, strict=True)
                 adapter_provenance = {"format": adapter_ckpt["format"], "stage": adapter_ckpt["stage"], "step": adapter_ckpt.get("step")}
             else:
                 from fabri_moss.train import initialize_adapter_weights
@@ -1037,6 +1449,15 @@ def main() -> None:
                     device=args.device,
                 )
             provenance["adapter_provenance"] = adapter_provenance
+            provenance["adapter_sha256"] = compute_file_sha256(adapter_path)
+            provenance["architecture_contract"].update(
+                {
+                    "adapter_format": adapter_ckpt.get("format"),
+                    "adapter_architecture_revision": adapter_ckpt.get("architecture_revision", "legacy_unversioned"),
+                    "cross_layers": list(moss_model.config.cross_layers),
+                    "max_frames": moss_model.config.max_frames,
+                }
+            )
             moss_model.eval()
 
             encode_fn, plan_fn, val_fn = make_moss_callbacks(moss_model)
@@ -1221,6 +1642,12 @@ def main() -> None:
             "status": "aborted_due_to_exception",
             "error": str(exc),
             "provenance": provenance,
+            "summary": {
+                "evaluation_kind": "single_task_async_closed_loop",
+                "official_mt50_500": False,
+                "async_success_rate": None,
+                "native_sota_success_rate": None,
+            },
             "episodes_completed": len(episode_results),
             "episodes": episode_results,
         }
@@ -1253,6 +1680,10 @@ def main() -> None:
             "is_smoke": is_smoke,
             "control_mode": args.control_mode,
             "mode": args.mode,
+            "evaluation_kind": "single_task_async_closed_loop",
+            "official_mt50_500": False,
+            "async_success_rate": success_rate,
+            "native_sota_success_rate": None,
         },
         "episodes": episode_results,
     }

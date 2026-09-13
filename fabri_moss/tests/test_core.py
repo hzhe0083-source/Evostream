@@ -365,6 +365,75 @@ def test_zero_gates_preserve_full_native_multimodal_sequence(tiny_setup):
     assert torch.allclose(shallow, native_shallow, atol=1e-5)
 
 
+def test_native_open_gate_masks_visual_padding_and_dedupes_current(tiny_setup):
+    """Historical KV changes only valid text/query tokens in a native padded batch."""
+    policy, moss, _ = tiny_setup
+    embedder = policy.embedder
+    image_token_id = 42
+    embedder.img_context_token_id = image_token_id
+    embedder._build_multimodal_prompt = lambda tiles, prompt: prompt
+
+    class NativeTokenOutput:
+        def __init__(self, input_ids):
+            self.input_ids = input_ids
+
+    class NativeTokenizer:
+        pad_token_id = 0
+        padding_side = "right"
+
+        def __call__(self, text, return_tensors="pt", **kwargs):
+            ids = torch.full((1, 24), 7, dtype=torch.long)
+            ids[:, :16] = image_token_id
+            ids[:, 20:] = 0
+            return NativeTokenOutput(ids)
+
+    embedder.tokenizer = NativeTokenizer()
+
+    def fuse(*, prompts, vit_embeds_batch, image_masks, batch_num_tiles_list):
+        fused = torch.cat(
+            [torch.cat([features, torch.ones(1, 8, 128)], dim=1) for features in vit_embeds_batch], dim=0
+        )
+        mask = torch.ones(len(vit_embeds_batch), 24, dtype=torch.bool)
+        mask[:, 20:] = False
+        return fused, mask
+
+    embedder._prepare_batch_and_fuse_embeddings = fuse
+    f0 = moss.project_frame(torch.randn(1, 16, 128), frame_id=0)
+    f1 = moss.project_frame(torch.randn(1, 16, 128), frame_id=1)
+    for block in moss.cross_blocks.values():
+        block.attn_gate.data.fill_(0.5)
+        block.mlp_gate.data.zero_()
+
+    with torch.no_grad():
+        opened, _ = moss.read_memory([f0, f1], "task", frame_ids=[0, 1], observation_times=[0.0, 1.0])
+        native_inputs, native_mask, image_mask = moss._prepare_native_queries_details(
+            f1.native_features, ["task"], require_image_mask=True
+        )
+        deduped, _ = moss.read_native_queries_batch(
+            [[f0, f1]], native_inputs, native_mask, [1], image_token_mask=image_mask
+        )
+        history_only, _ = moss.read_native_queries_batch(
+            [[f0]], native_inputs, native_mask, [1], image_token_mask=image_mask
+        )
+        for block in moss.cross_blocks.values():
+            block.attn_gate.data.zero_()
+        closed, _ = moss.read_memory([f0, f1], "task", frame_ids=[0, 1], observation_times=[0.0, 1.0])
+
+    diff = (opened - closed).abs().amax(dim=-1)
+    assert diff[:, :16].max() == 0  # image tokens stay on native path
+    assert diff[:, 20:].max() == 0  # right padding stays untouched
+    assert diff[:, 16:20].max() > 0  # valid text receives historical residual
+    assert torch.equal(deduped, history_only)  # current f1 is not read twice
+
+
+def test_framekv_records_architecture_and_frame_coordinate(tiny_setup):
+    _, moss, config = tiny_setup
+    frame = moss.project_frame(torch.randn(1, 16, 128), frame_id=3, observation_time=0.25)
+    assert frame.architecture_revision == config.architecture_revision == moss.architecture_revision
+    assert frame.temporal_coordinate == config.temporal_coordinate == "frame_index"
+    assert frame.observation_time == pytest.approx(0.25)
+
+
 def _native_query_inputs(moss, prompt: str = "move robot"):
     toks = moss.policy.embedder.tokenizer(prompt, return_tensors="pt")
     text = moss.native_core.embed_tokens(toks.input_ids)

@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 from dataclasses import replace as dataclass_replace
 import math
+import threading
 from collections import deque
 from dataclasses import dataclass
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
@@ -14,6 +15,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from fabri_moss.delta import DeltaMemoryState, delta_read, delta_update
+
+
+# This is a data-contract marker, not the mutable model ``_revision``.  A
+# FrameKV made by one architecture must never be consumed by another one.
+MOSS_ARCHITECTURE_REVISION = "moss_native_consume_v2"
+FRAME_INDEX_COORDINATE = "frame_index"
 
 
 @dataclass(frozen=True)
@@ -26,13 +33,16 @@ class MossConfig:
     rope_base: float = 1e6
     memory_mode: str = "consume"
     train_vision: bool = False
-    temporal_coordinate: str = "frame_index"
+    temporal_coordinate: str = FRAME_INDEX_COORDINATE
+    architecture_revision: str = MOSS_ARCHITECTURE_REVISION
 
     def validate(self, num_native_layers: int) -> None:
         if self.memory_mode not in ("consume", "delta"):
             raise ValueError(f"memory_mode must be 'consume' or 'delta', got {self.memory_mode!r}")
-        if self.temporal_coordinate != "frame_index":
-            raise ValueError("temporal_coordinate must be 'frame_index'")
+        if not isinstance(self.architecture_revision, str) or not self.architecture_revision.strip():
+            raise ValueError("architecture_revision must be a non-empty string")
+        if self.temporal_coordinate != FRAME_INDEX_COORDINATE:
+            raise ValueError(f"temporal_coordinate must be '{FRAME_INDEX_COORDINATE}'")
         if self.num_readout_tokens <= 0:
             raise ValueError(f"num_readout_tokens must be > 0, got {self.num_readout_tokens}")
         if self.max_frames is not None and self.max_frames <= 0:
@@ -68,6 +78,9 @@ class FrameKV:
     # the native FabriVLA query path to remain intact while older frames live
     # only in independent K/V memory.
     native_features: Optional[torch.Tensor] = None
+    architecture_revision: str = MOSS_ARCHITECTURE_REVISION
+    temporal_coordinate: str = FRAME_INDEX_COORDINATE
+    observation_time: Optional[float] = None
 
 
 def build_causal_cross_mask(
@@ -282,7 +295,7 @@ class MossInternVL(nn.Module):
         base_embed = None
         if hasattr(self.policy.embedder, "img_context_token_id"):
             img_ctx_id = self.policy.embedder.img_context_token_id
-            if 0 <= img_ctx_id < core.embed_tokens.weight.shape[0]:
+            if isinstance(img_ctx_id, int) and 0 <= img_ctx_id < core.embed_tokens.weight.shape[0]:
                 with torch.no_grad():
                     base_embed = core.embed_tokens.weight[img_ctx_id].clone().float()
 
@@ -301,6 +314,10 @@ class MossInternVL(nn.Module):
         embedder = self.policy.embedder
         lm = embedder.model.language_model
         return lm.model if hasattr(lm, "model") else lm
+
+    @property
+    def architecture_revision(self) -> str:
+        return self.config.architecture_revision
 
     def train(self, mode: bool = True):
         super().train(mode)
@@ -412,39 +429,209 @@ class MossInternVL(nn.Module):
                 raise ValueError(f"expected batched visual features [B,P,H], got {tuple(features.shape)}")
             return features.detach()
 
-    def prepare_native_queries(
-        self, features: torch.Tensor, prompts: Sequence[str]
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Fuse precomputed visual features with unchanged native prompts."""
+    def _tokenize_native_prompt(self, prompt: str, seq_len: int) -> torch.Tensor:
+        """Return padded ids used to locate native image context tokens."""
+        embedder = self.policy.embedder
+        tokenizer = getattr(embedder, "tokenizer", None)
+        if tokenizer is None or not callable(tokenizer):
+            raise AttributeError(
+                "native multimodal path requires policy.embedder.tokenizer to locate image tokens"
+            )
+        if type(seq_len) is not int or seq_len <= 0:
+            raise ValueError(f"native sequence length must be positive int, got {seq_len}")
+
+        try:
+            token_out = tokenizer(
+                prompt,
+                return_tensors="pt",
+                padding="max_length",
+                truncation=True,
+                max_length=seq_len,
+            )
+        except TypeError as exc:
+            # Tiny/legacy tokenizers may only accept ``return_tensors``.  Keep
+            # this narrow so errors raised inside a tokenizer are not hidden.
+            msg = str(exc).lower()
+            if "unexpected keyword" not in msg and "keyword argument" not in msg:
+                raise
+            token_out = tokenizer(prompt, return_tensors="pt")
+
+        if isinstance(token_out, dict):
+            input_ids = token_out.get("input_ids")
+        else:
+            input_ids = getattr(token_out, "input_ids", None)
+        if input_ids is None:
+            raise AttributeError("native tokenizer output must provide input_ids")
+        if not isinstance(input_ids, torch.Tensor):
+            input_ids = torch.as_tensor(input_ids, dtype=torch.long)
+        if input_ids.ndim == 1:
+            input_ids = input_ids.unsqueeze(0)
+        if input_ids.ndim != 2 or input_ids.shape[0] != 1:
+            raise ValueError(
+                f"native tokenizer input_ids must have shape [1,S], got {tuple(input_ids.shape)}"
+            )
+        if input_ids.shape[1] > seq_len:
+            input_ids = input_ids[:, :seq_len]
+        elif input_ids.shape[1] < seq_len:
+            pad_id = getattr(tokenizer, "pad_token_id", 0)
+            pad_id = 0 if pad_id is None else int(pad_id)
+            pad = torch.full(
+                (1, seq_len - input_ids.shape[1]),
+                pad_id,
+                dtype=input_ids.dtype,
+                device=input_ids.device,
+            )
+            if getattr(tokenizer, "padding_side", "right") == "left":
+                input_ids = torch.cat([pad, input_ids], dim=1)
+            else:
+                input_ids = torch.cat([input_ids, pad], dim=1)
+        return input_ids
+
+    def _prepare_native_queries_details(
+        self, features: torch.Tensor, prompts: Sequence[str], *, require_image_mask: bool
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        """Fuse native queries and resolve exact image positions when needed."""
         if features.ndim != 3 or features.shape[0] != len(prompts):
             raise ValueError("features must have shape [B,P,H] and match prompts")
         embedder = self.policy.embedder
         prompts_clean = [p.strip() for p in prompts]
         if any(not p for p in prompts_clean):
             raise ValueError("prompts must be non-empty")
-        frame_prompts = [embedder._build_multimodal_prompt([1], p) for p in prompts_clean]
+        if not hasattr(embedder, "_build_multimodal_prompt"):
+            raise AttributeError("native multimodal path requires embedder._build_multimodal_prompt")
+        frame_prompts = []
+        for p in prompts_clean:
+            try:
+                built = embedder._build_multimodal_prompt([1], p)
+            except TypeError as exc:
+                # A few native embedders expose the batch-shaped builder
+                # ``([[tiles]], [prompts])`` instead of the single-frame
+                # signature.  Fall back only for a signature mismatch.
+                msg = str(exc).lower()
+                if "argument" not in msg and "iterable" not in msg:
+                    raise
+                batch_built = embedder._build_multimodal_prompt([[1]], [p])
+                if not isinstance(batch_built, (list, tuple)) or len(batch_built) != 1:
+                    raise ValueError("batch multimodal prompt builder must return one prompt")
+                built = batch_built[0]
+            if isinstance(built, (list, tuple)):
+                if len(built) != 1:
+                    raise ValueError("_build_multimodal_prompt([1], prompt) must return one prompt")
+                built = built[0]
+            if not isinstance(built, str):
+                raise TypeError(
+                    f"_build_multimodal_prompt must return str for one frame, got {type(built).__name__}"
+                )
+            frame_prompts.append(built)
         masks = [torch.ones(1, dtype=torch.bool, device=features.device) for _ in prompts_clean]
         feature_list = [features[i : i + 1] for i in range(features.shape[0])]
+        provided_image_mask: Optional[torch.Tensor] = None
         if hasattr(embedder, "_prepare_batch_and_fuse_embeddings"):
-            fused, attn = embedder._prepare_batch_and_fuse_embeddings(
+            fused_result = embedder._prepare_batch_and_fuse_embeddings(
                 prompts=frame_prompts,
                 vit_embeds_batch=feature_list,
                 image_masks=masks,
                 batch_num_tiles_list=[[1] for _ in prompts_clean],
             )
+            if isinstance(fused_result, (tuple, list)) and len(fused_result) == 3:
+                fused, attn, provided_image_mask = fused_result
+            else:
+                fused, attn = fused_result
         else:
             fused_parts, mask_parts = [], []
             for p, f, m in zip(frame_prompts, feature_list, masks):
-                fused_i, mask_i = embedder._prepare_and_fuse_embeddings(
+                fused_result = embedder._prepare_and_fuse_embeddings(
                     prompt=p, vit_embeds=f, image_mask=m, num_tiles_list=[1]
                 )
+                if isinstance(fused_result, (tuple, list)) and len(fused_result) == 3:
+                    fused_i, mask_i, image_mask_i = fused_result
+                    if provided_image_mask is None:
+                        provided_image_mask = []
+                    if not isinstance(provided_image_mask, list):
+                        raise ValueError("native fuser returned mixed image-mask formats")
+                    provided_image_mask.append(image_mask_i)
+                else:
+                    fused_i, mask_i = fused_result
                 fused_parts.append(fused_i)
                 mask_parts.append(mask_i)
             fused, attn = torch.cat(fused_parts, dim=0), torch.cat(mask_parts, dim=0)
         core = self.native_core
-        return fused.to(device=core.embed_tokens.weight.device, dtype=core.embed_tokens.weight.dtype), attn.to(
-            device=core.embed_tokens.weight.device
+        if not isinstance(fused, torch.Tensor) or fused.ndim != 3:
+            raise ValueError(f"native fuser must return fused [B,S,H], got {type(fused).__name__}")
+        if fused.shape[0] != len(prompts_clean) or fused.shape[2] != core.config.hidden_size:
+            raise ValueError(
+                f"native fused shape {tuple(fused.shape)} does not match "
+                f"({len(prompts_clean)}, S, {core.config.hidden_size})"
+            )
+        if not isinstance(attn, torch.Tensor) or attn.shape != fused.shape[:2]:
+            raise ValueError(
+                f"native fuser attention mask must have shape {tuple(fused.shape[:2])}, "
+                f"got {tuple(attn.shape) if isinstance(attn, torch.Tensor) else type(attn).__name__}"
+            )
+
+        image_mask: Optional[torch.Tensor] = None
+        if require_image_mask:
+            if isinstance(provided_image_mask, list):
+                provided_image_mask = torch.cat(provided_image_mask, dim=0)
+            if provided_image_mask is not None:
+                if not isinstance(provided_image_mask, torch.Tensor) or provided_image_mask.shape != fused.shape[:2]:
+                    raise ValueError(
+                        f"native fuser image mask must have shape {tuple(fused.shape[:2])}"
+                    )
+                image_mask = provided_image_mask.to(device=fused.device, dtype=torch.bool)
+                expected_counts = [int(x.shape[0]) for x in features]
+                actual_counts = [int(x) for x in image_mask.sum(dim=1).tolist()]
+                if actual_counts != expected_counts:
+                    raise ValueError(
+                        f"native fuser image-token counts {actual_counts} do not match visual token counts {expected_counts}"
+                    )
+            else:
+                image_token_id = getattr(embedder, "img_context_token_id", None)
+                if image_token_id is None:
+                    tokenizer = getattr(embedder, "tokenizer", None)
+                    convert = getattr(tokenizer, "convert_tokens_to_ids", None)
+                    if callable(convert):
+                        image_token_id = convert("<IMG_CONTEXT>")
+                if isinstance(image_token_id, torch.Tensor) and image_token_id.numel() == 1:
+                    image_token_id = int(image_token_id.item())
+                if type(image_token_id) is not int:
+                    raise AttributeError(
+                        "native multimodal path requires a valid embedder.img_context_token_id "
+                        "or tokenizer.convert_tokens_to_ids('<IMG_CONTEXT>')"
+                    )
+                masks_by_sample = []
+                for i, p in enumerate(frame_prompts):
+                    ids = self._tokenize_native_prompt(p, int(fused.shape[1])).to(device=fused.device)
+                    mask_i = ids.eq(image_token_id)
+                    expected = int(features[i].shape[0])
+                    actual = int(mask_i.sum().item())
+                    if actual != expected:
+                        raise ValueError(
+                            f"native image-token count {actual} for sample {i} does not match "
+                            f"visual token count {expected}"
+                        )
+                    masks_by_sample.append(mask_i)
+                image_mask = torch.cat(masks_by_sample, dim=0).to(device=fused.device)
+
+        return (
+            fused.to(device=core.embed_tokens.weight.device, dtype=core.embed_tokens.weight.dtype),
+            attn.to(device=core.embed_tokens.weight.device),
+            image_mask.to(device=core.embed_tokens.weight.device) if image_mask is not None else None,
         )
+
+    def prepare_native_queries(
+        self, features: torch.Tensor, prompts: Sequence[str], *, return_image_mask: bool = False
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Fuse precomputed visual features with unchanged native prompts.
+
+        ``return_image_mask`` is opt-in to preserve the existing two-value API.
+        """
+        fused, attn, image_mask = self._prepare_native_queries_details(
+            features, prompts, require_image_mask=return_image_mask
+        )
+        if return_image_mask:
+            return fused, attn, image_mask  # type: ignore[return-value]
+        return fused, attn
 
     def project_frame(
         self,
@@ -547,12 +734,17 @@ class MossInternVL(nn.Module):
             revision=self._revision,
             num_tokens=P,
             native_features=native_features,
+            architecture_revision=self.config.architecture_revision,
+            temporal_coordinate=self.config.temporal_coordinate,
+            observation_time=float(observation_time) if observation_time is not None else None,
         )
 
-    def _validate_frames(self, frames: Sequence[FrameKV]) -> None:
+    def _validate_frames(
+        self, frames: Sequence[FrameKV], *, enforce_max_frames: bool = True
+    ) -> None:
         if not frames:
             raise ValueError("frames sequence must be non-empty")
-        if self.config.max_frames is not None and len(frames) > self.config.max_frames:
+        if enforce_max_frames and self.config.max_frames is not None and len(frames) > self.config.max_frames:
             raise ValueError(f"frames length {len(frames)} exceeds max_frames {self.config.max_frames}")
 
         num_layers = len(self.config.cross_layers)
@@ -561,6 +753,23 @@ class MossInternVL(nn.Module):
                 raise ValueError(f"FrameKV at index {i} was created by foreign owner")
             if f.revision != self._revision:
                 raise ValueError(f"FrameKV at index {i} has stale revision {f.revision} (current {self._revision})")
+            if f.architecture_revision != self.config.architecture_revision:
+                raise ValueError(
+                    f"FrameKV at index {i} has architecture_revision {f.architecture_revision!r}; "
+                    f"expected {self.config.architecture_revision!r}"
+                )
+            if f.temporal_coordinate != self.config.temporal_coordinate:
+                raise ValueError(
+                    f"FrameKV at index {i} has temporal_coordinate {f.temporal_coordinate!r}; "
+                    f"expected {self.config.temporal_coordinate!r}"
+                )
+            if f.observation_time is not None and (
+                isinstance(f.observation_time, bool)
+                or not isinstance(f.observation_time, (int, float))
+                or not math.isfinite(float(f.observation_time))
+                or float(f.observation_time) < 0.0
+            ):
+                raise ValueError(f"FrameKV at index {i} has invalid observation_time {f.observation_time!r}")
             if type(f.frame_id) is not int or f.frame_id < 0:
                 raise ValueError(f"FrameKV at index {i} has invalid non-negative frame_id {f.frame_id}")
             if i > 0 and f.frame_id <= frames[i - 1].frame_id:
@@ -619,32 +828,22 @@ class MossInternVL(nn.Module):
         can_fuse_native = hasattr(self.policy.embedder, "_build_multimodal_prompt")
         native_path = native_features is not None and can_fuse_native
         if native_path:
-            native_inputs, native_attention_mask = self.prepare_native_queries(
-                native_features.to(device=device), [clean_prompt]
+            require_image_mask = memory_matrices is not None or len(frames) > 1
+            native_inputs, native_attention_mask, native_visual_query_mask = self._prepare_native_queries_details(
+                native_features.to(device=device),
+                [clean_prompt],
+                require_image_mask=require_image_mask,
             )
             hidden_states = native_inputs.to(device=device, dtype=base_dtype)
             # Preserve the exact native multimodal sequence and padding mask.
             # Synthetic readout tokens would break gate=0 FabriVLA parity.
             attention_mask_2d = native_attention_mask.to(device=device)
-            # Historical cross-attention is for text/query positions. Keep
-            # the current image patch tokens on the native FabriVLA path.
-            native_visual_query_mask = None
-            try:
-                fused_prompt = self.policy.embedder._build_multimodal_prompt([1], clean_prompt)
-                if hasattr(self.policy.embedder, "_get_tokenized_prompt"):
-                    ids, _ = self.policy.embedder._get_tokenized_prompt(fused_prompt, [1])
-                    ids = ids.unsqueeze(0).to(device)
-                else:
-                    ids = self.policy.embedder.tokenizer(fused_prompt, return_tensors="pt").input_ids.to(device)
-                image_token_id = getattr(self.policy.embedder, "img_context_token_id", None)
-                if image_token_id is not None and tuple(ids.shape[1:]) == (hidden_states.shape[1],):
-                    native_visual_query_mask = ids.eq(int(image_token_id))
-            except Exception:
-                # Some lightweight test embedders do not expose token ids.
-                native_visual_query_mask = None
         else:
             tokenizer = self.policy.embedder.tokenizer
-            tokens = tokenizer(prompt_text, return_tensors="pt")
+            # Synthetic/legacy embedders do not understand multimodal frame
+            # markers.  Keep their prompt unchanged; the native path above
+            # handles exact image-token placement and timestamps.
+            tokens = tokenizer(clean_prompt, return_tensors="pt")
             input_ids = tokens.input_ids.to(device)
             text_len = input_ids.shape[1]
             if text_len > self.config.max_text_tokens:
@@ -669,6 +868,11 @@ class MossInternVL(nn.Module):
             q_abs = torch.arange(total_seq_len, device=device).view(total_seq_len, 1)
             k_abs = torch.arange(total_seq_len, device=device).view(1, total_seq_len)
             allowed = (k_abs <= q_abs) & attention_mask_2d.bool().view(1, total_seq_len)
+            if native_visual_query_mask is not None:
+                padding_queries = ~attention_mask_2d.bool()
+                allowed = allowed & ~padding_queries.unsqueeze(-1)
+                diagonal = torch.eye(total_seq_len, dtype=torch.bool, device=device).unsqueeze(0)
+                allowed = allowed | (padding_queries.unsqueeze(-1) & diagonal)
             causal_mask = torch.full(
                 (1, 1, total_seq_len, total_seq_len), torch.finfo(base_dtype).min,
                 device=device, dtype=base_dtype,
@@ -707,16 +911,32 @@ class MossInternVL(nn.Module):
             if not all(math.isfinite(t) for t in provided_observation_times):
                 raise ValueError("observation_times must contain finite values")
             if any(
-                provided_observation_times[i] <= provided_observation_times[i - 1]
+                provided_observation_times[i] < provided_observation_times[i - 1]
                 for i in range(1, len(provided_observation_times))
             ):
                 raise ValueError(
-                    "observation_times must be strictly increasing to preserve causal ordering"
+                    "observation_times must be non-decreasing to preserve causal ordering"
                 )
 
         # All internal temporal operations use the discrete frame coordinate;
         # the provided physical timestamps are validated above for provenance.
         effective_observation_times = [float(fid) for fid in effective_frame_ids]
+
+        # Native consume reads the current frame through its original
+        # multimodal sequence and historical frames through FrameKV.  Route it
+        # through the batch reader so masking/deduplication stay identical for
+        # single and batched calls.  Delta keeps the legacy matrix path below.
+        if native_path and memory_matrices is None and len(frames) > 1:
+            if native_visual_query_mask is None:
+                raise RuntimeError("native image-token mask is required when historical memory is read")
+            return self.read_native_queries_batch(
+                [frames],
+                hidden_states,
+                attention_mask_2d,
+                [effective_frame_ids[-1]],
+                image_token_mask=native_visual_query_mask,
+                exclude_current=True,
+            )
 
         # The newest frame is already present in the native query sequence.
         # Only older frames are auxiliary memory on that path; this avoids
@@ -823,8 +1043,19 @@ class MossInternVL(nn.Module):
         inputs_embeds: torch.Tensor,
         attention_mask: torch.Tensor,
         current_frame_ids: Sequence[int],
+        image_token_mask: Optional[torch.Tensor] = None,
+        *,
+        exclude_current: Optional[bool] = None,
+        image_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Run native layers in batch while each sample reads its own FrameKV set."""
+        """Run native layers in batch while each sample reads its own FrameKV set.
+
+        ``image_token_mask`` identifies the exact native visual query tokens.
+        The matching current-frame KV is excluded because that frame is
+        already represented by the native query sequence.  The optional mask
+        only controls which query positions receive the residual; omitting it
+        treats every valid token as a text/query token for legacy callers.
+        """
         if inputs_embeds.ndim != 3:
             raise ValueError("inputs_embeds must have shape [B,S,H]")
         batch_size, seq_len, hidden_size = inputs_embeds.shape
@@ -834,14 +1065,39 @@ class MossInternVL(nn.Module):
             raise ValueError(f"attention_mask must have shape {(batch_size, seq_len)}, got {tuple(attention_mask.shape)}")
         if any(type(fid) is not int or fid < 0 for fid in current_frame_ids):
             raise ValueError("current_frame_ids must contain non-negative integers")
+        if image_token_mask is not None and image_mask is not None:
+            raise ValueError("pass only one of image_token_mask or image_mask")
+        if image_token_mask is None:
+            image_token_mask = image_mask
+        if image_token_mask is None:
+            image_mask = torch.zeros(
+                (batch_size, seq_len), dtype=torch.bool, device=inputs_embeds.device
+            )
+            if exclude_current is None:
+                # Synthetic legacy queries are generally all-valid; a padded
+                # sequence is native-like and already contains its current
+                # frame, so exclude the matching KV in that case.
+                exclude_current = not bool(torch.all(attention_mask.bool()).item())
+        else:
+            if image_token_mask.shape != (batch_size, seq_len):
+                raise ValueError(
+                    f"image_token_mask must have shape {(batch_size, seq_len)}, "
+                    f"got {tuple(image_token_mask.shape)}"
+                )
+            image_mask = image_token_mask.to(device=inputs_embeds.device, dtype=torch.bool)
+            if exclude_current is None:
+                exclude_current = True
+        assert exclude_current is not None
         for frames in frame_sets:
-            self._validate_frames(frames)
+            self._validate_frames(frames, enforce_max_frames=not bool(exclude_current))
         core = self.native_core
         if hidden_size != core.config.hidden_size:
             raise ValueError(f"inputs_embeds hidden size {hidden_size} != native hidden size {core.config.hidden_size}")
         device = core.embed_tokens.weight.device
         h = inputs_embeds.to(device=device, dtype=core.embed_tokens.weight.dtype)
         native_mask_2d = attention_mask.to(device=device)
+        image_mask = image_mask.to(device=device)
+        valid_query_mask = native_mask_2d.bool() & ~image_mask
         attn_impl = getattr(core.config, "_attn_implementation", "eager")
         if attn_impl == "flash_attention_2":
             native_mask = native_mask_2d
@@ -849,6 +1105,15 @@ class MossInternVL(nn.Module):
             q_abs = torch.arange(seq_len, device=device).view(seq_len, 1)
             k_abs = torch.arange(seq_len, device=device).view(1, seq_len)
             allowed = (k_abs <= q_abs).unsqueeze(0) & native_mask_2d.bool().unsqueeze(1)
+            if image_token_mask is not None:
+                # Right-padding queries are not part of the native sequence
+                # semantics.  Keep them self-contained so a cross residual on
+                # an earlier text token cannot leak into padded outputs on a
+                # later native layer.
+                padding_queries = ~native_mask_2d.bool()
+                allowed = allowed & ~padding_queries.unsqueeze(-1)
+                diagonal = torch.eye(seq_len, dtype=torch.bool, device=device).unsqueeze(0)
+                allowed = allowed | (padding_queries.unsqueeze(-1) & diagonal)
             native_mask = torch.full(
                 (batch_size, 1, seq_len, seq_len), torch.finfo(h.dtype).min,
                 dtype=h.dtype, device=device
@@ -857,10 +1122,27 @@ class MossInternVL(nn.Module):
         position_ids = torch.arange(seq_len, dtype=torch.long, device=device).unsqueeze(0)
         position_embeddings = core.rotary_emb(h, position_ids)
 
-        max_memory_tokens = max(sum(f.num_tokens for f in frames) for frames in frame_sets)
+        memory_sets: List[Tuple[FrameKV, ...]] = []
+        for frames, current_id in zip(frame_sets, current_frame_ids):
+            selected = tuple(
+                f for f in frames
+                if not (exclude_current and f.frame_id == current_id)
+            )
+            memory_sets.append(selected)
+
+        max_memory_tokens = max(
+            1,
+            max((sum(f.num_tokens for f in frames) for frames in memory_sets), default=0),
+        )
         cross_masks: Dict[int, torch.Tensor] = {}
         padded_keys: Dict[int, torch.Tensor] = {}
         padded_values: Dict[int, torch.Tensor] = {}
+        has_visible_memory = torch.tensor(
+            [any(frame.frame_id <= current_id for frame in frames)
+             for frames, current_id in zip(memory_sets, current_frame_ids)],
+            dtype=torch.bool,
+            device=device,
+        )
         for lay_pos, layer_idx in enumerate(self.config.cross_layers):
             block = self.cross_blocks[str(layer_idx)]
             k_batch = torch.zeros(
@@ -872,7 +1154,7 @@ class MossInternVL(nn.Module):
                 (batch_size, 1, seq_len, max_memory_tokens), float("-inf"),
                 dtype=torch.float32, device=device
             )
-            for b, frames in enumerate(frame_sets):
+            for b, frames in enumerate(memory_sets):
                 offset = 0
                 for frame in frames:
                     n = frame.num_tokens
@@ -881,23 +1163,54 @@ class MossInternVL(nn.Module):
                     if frame.frame_id <= current_frame_ids[b]:
                         mask_batch[b, 0, :, offset : offset + n] = 0.0
                     offset += n
-                if offset == 0 or torch.isneginf(mask_batch[b, 0, 0]).all():
-                    raise ValueError(f"sample {b} has no FrameKV visible at current_frame_id={current_frame_ids[b]}")
+                if not has_visible_memory[b]:
+                    # SDPA returns NaNs for an all-masked row.  A dummy key is
+                    # harmless because its cross result is never selected for
+                    # this sample, and it keeps mixed current-only batches
+                    # well-defined.
+                    mask_batch[b, 0, :, 0] = 0.0
+                    if not exclude_current:
+                        raise ValueError(
+                            f"sample {b} has no FrameKV visible at current_frame_id={current_frame_ids[b]}"
+                        )
             padded_keys[layer_idx] = k_batch
             padded_values[layer_idx] = v_batch
             cross_masks[layer_idx] = mask_batch
 
+        native_mask_after_cross = native_mask
+        if image_token_mask is not None and attn_impl != "flash_attention_2":
+            # Once historical cross attention has changed text/query states,
+            # later causal layers must not feed that delta back into image or
+            # right-padding queries.  Keep their native interactions with
+            # other protected positions and their diagonal self path.
+            protected_queries = (
+                (~native_mask_2d.bool() | image_mask) & has_visible_memory.unsqueeze(1)
+            )
+            allowed_after = allowed & ~(
+                protected_queries.unsqueeze(-1) & valid_query_mask.unsqueeze(1)
+            )
+            diagonal = torch.eye(seq_len, dtype=torch.bool, device=device).unsqueeze(0)
+            allowed_after = allowed_after | (protected_queries.unsqueeze(-1) & diagonal)
+            native_mask_after_cross = torch.full(
+                (batch_size, 1, seq_len, seq_len), torch.finfo(h.dtype).min,
+                dtype=h.dtype, device=device
+            )
+            native_mask_after_cross.masked_fill_(allowed_after.unsqueeze(1), 0.0)
+
         shallow_states = None
+        cross_seen = False
         for layer_num, native_layer in enumerate(core.layers, start=1):
             out = native_layer(
-                h, attention_mask=native_mask, position_ids=position_ids,
+                h,
+                attention_mask=native_mask_after_cross if cross_seen else native_mask,
+                position_ids=position_ids,
                 past_key_value=None, output_attentions=False, use_cache=False,
                 cache_position=None, position_embeddings=position_embeddings,
             )
             h = out[0] if isinstance(out, tuple) else out
-            if layer_num in self.config.cross_layers:
+            if layer_num in self.config.cross_layers and bool(has_visible_memory.any().item()):
                 block = self.cross_blocks[str(layer_num)]
-                h = block(
+                cross_h = block(
                     hidden_states=h,
                     key_states=padded_keys[layer_num],
                     value_states=padded_values[layer_num],
@@ -905,6 +1218,9 @@ class MossInternVL(nn.Module):
                     sin_q=position_embeddings[1],
                     cross_attention_mask=cross_masks[layer_num],
                 )
+                apply_cross = valid_query_mask & has_visible_memory.unsqueeze(1)
+                h = torch.where(apply_cross.unsqueeze(-1), cross_h, h)
+                cross_seen = True
             if layer_num == self.config.shallow_layer:
                 shallow_states = h.float()
         if shallow_states is None:
@@ -917,12 +1233,22 @@ class MossInternVL(nn.Module):
         inputs_embeds: torch.Tensor,
         attention_mask: torch.Tensor,
         current_frame_id: int,
+        image_token_mask: Optional[torch.Tensor] = None,
+        *,
+        exclude_current: Optional[bool] = None,
+        image_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Single-sample convenience wrapper for ``read_native_queries_batch``."""
         if inputs_embeds.ndim != 3 or inputs_embeds.shape[0] != 1:
             raise ValueError("inputs_embeds must have shape [1,S,H]")
         return self.read_native_queries_batch(
-            [frames], inputs_embeds, attention_mask, [current_frame_id]
+            [frames],
+            inputs_embeds,
+            attention_mask,
+            [current_frame_id],
+            image_token_mask=image_token_mask,
+            exclude_current=exclude_current,
+            image_mask=image_mask,
         )
 
     def read_memory(
@@ -936,7 +1262,10 @@ class MossInternVL(nn.Module):
             raise RuntimeError(
                 "read_memory is only available in 'consume' mode. In 'delta' mode, use read_delta to avoid dropping state."
             )
-        self._validate_frames(frames)
+        # Consume memory is episode-scoped; its session may contain more than
+        # the legacy bounded training window.  Delta retains the explicit
+        # bounded-state contract below.
+        self._validate_frames(frames, enforce_max_frames=False)
         return self._execute_language_layers(
             frames,
             prompt,
@@ -1060,11 +1389,19 @@ class MossInternVL(nn.Module):
         return self.read_memory(frames, prompt)
 
 
+_DEFAULT_SESSION_MAX_FRAMES = object()
+
+
 class VisionSession:
-    def __init__(self, model: MossInternVL):
+    def __init__(self, model: MossInternVL, max_frames: Any = _DEFAULT_SESSION_MAX_FRAMES):
         self.model = model
-        self.max_frames = model.config.max_frames
+        self.max_frames = model.config.max_frames if max_frames is _DEFAULT_SESSION_MAX_FRAMES else max_frames
+        if self.max_frames is not None and (
+            type(self.max_frames) is bool or not isinstance(self.max_frames, int) or self.max_frames <= 0
+        ):
+            raise ValueError(f"max_frames must be positive int or None, got {self.max_frames}")
         self._cache: deque[FrameKV] = deque(maxlen=self.max_frames)
+        self._lock = threading.RLock()
         self.episode_id: Optional[str] = None
         self.prompt: Optional[str] = None
         self._model_revision: int = model._revision
@@ -1075,17 +1412,23 @@ class VisionSession:
         if not isinstance(prompt, str) or not prompt.strip():
             raise ValueError("Prompt must be non-empty string")
         clean_prompt = prompt.strip()
-        tokenizer = self.model.policy.embedder.tokenizer
+        tokenizer = getattr(self.model.policy.embedder, "tokenizer", None)
+        if tokenizer is None or not callable(tokenizer):
+            raise AttributeError("VisionSession requires policy.embedder.tokenizer")
         tokens = tokenizer(clean_prompt, return_tensors="pt")
-        text_len = tokens.input_ids.shape[1]
+        token_ids = tokens.get("input_ids") if isinstance(tokens, dict) else getattr(tokens, "input_ids", None)
+        if token_ids is None or not isinstance(token_ids, torch.Tensor) or token_ids.ndim != 2:
+            raise ValueError("tokenizer output must provide 2D input_ids")
+        text_len = token_ids.shape[1]
         if text_len > self.model.config.max_text_tokens:
             raise ValueError(
                 f"Prompt token length {text_len} exceeds max_text_tokens {self.model.config.max_text_tokens}"
             )
-        self._cache.clear()
-        self.episode_id = episode_id.strip()
-        self.prompt = clean_prompt
-        self._model_revision = self.model._revision
+        with self._lock:
+            self._cache.clear()
+            self.episode_id = episode_id.strip()
+            self.prompt = clean_prompt
+            self._model_revision = self.model._revision
 
     def append(self, images: List[Any], frame_id: int, observation_time: Optional[float] = None) -> None:
         if self.model.training:
@@ -1104,35 +1447,117 @@ class VisionSession:
             )
 
         features = self.model.encode_image(images)
-        frame_kv = self.model.project_frame(
-            features, frame_id=frame_id, observation_time=observation_time
+        self.append_frame(
+            self.model.project_frame(features, frame_id=frame_id, observation_time=observation_time)
         )
 
-        cached_frame = FrameKV(
-            frame_id=frame_id,
-            keys=tuple(k.detach() for k in frame_kv.keys),
-            values=tuple(v.detach() for v in frame_kv.values),
-            owner=self.model,
-            revision=frame_kv.revision,
-            num_tokens=frame_kv.num_tokens,
-            native_features=frame_kv.native_features,
-        )
-        self._cache.append(cached_frame)
+    def append_frame(self, frame: FrameKV) -> None:
+        """Append an already projected frame exactly once.
 
-    def query(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        This is used by the asynchronous consume path so vision encoding and
+        K/V projection are never repeated during planning.
+        """
+        if self.model.training:
+            raise RuntimeError("VisionSession.append_frame is only allowed when model is in eval mode")
+        if torch.is_grad_enabled():
+            raise RuntimeError("VisionSession.append_frame requires torch.no_grad() to be active")
+        if self.prompt is None or self.episode_id is None:
+            raise RuntimeError("VisionSession prompt and episode_id must be set via reset() before appending")
+        if self._model_revision != self.model._revision:
+            raise RuntimeError("VisionSession invalidated due to model revision change (train/stage update)")
+        if not isinstance(frame, FrameKV):
+            raise TypeError(f"frame must be FrameKV, got {type(frame).__name__}")
+        self.model._validate_frames([frame], enforce_max_frames=False)
+        with self._lock:
+            if len(self._cache) > 0 and frame.frame_id <= self._cache[-1].frame_id:
+                raise ValueError(
+                    f"frame_id {frame.frame_id} must be strictly greater than previous {self._cache[-1].frame_id}"
+                )
+            if self._cache and frame.observation_time is not None:
+                previous_time = self._cache[-1].observation_time
+                if previous_time is not None and frame.observation_time < previous_time:
+                    raise ValueError(
+                        f"observation_time {frame.observation_time} must be non-decreasing from {previous_time}"
+                    )
+
+            cached_frame = FrameKV(
+                frame_id=frame.frame_id,
+                keys=tuple(k.detach() for k in frame.keys),
+                values=tuple(v.detach() for v in frame.values),
+                owner=self.model,
+                revision=frame.revision,
+                num_tokens=frame.num_tokens,
+                native_features=frame.native_features.detach() if frame.native_features is not None else None,
+                architecture_revision=frame.architecture_revision,
+                temporal_coordinate=frame.temporal_coordinate,
+                observation_time=frame.observation_time,
+            )
+            self._cache.append(cached_frame)
+
+    def snapshot(self, upto_frame_id: Optional[int] = None) -> Tuple[FrameKV, ...]:
+        """Return an immutable prefix of the session for one planning cutoff."""
+        with self._lock:
+            if self.prompt is None or self.episode_id is None:
+                raise RuntimeError("VisionSession not initialized. Call reset() first.")
+            if upto_frame_id is None:
+                return tuple(self._cache)
+            if type(upto_frame_id) is not int or upto_frame_id < 0:
+                raise ValueError(f"upto_frame_id must be a non-negative integer, got {upto_frame_id}")
+            return tuple(frame for frame in self._cache if frame.frame_id <= upto_frame_id)
+
+    def clear(self) -> None:
+        """Release cached frames and episode identity."""
+        with self._lock:
+            self._cache.clear()
+            self.episode_id = None
+            self.prompt = None
+
+    def query(self, upto_frame_id: Optional[int] = None) -> Tuple[torch.Tensor, torch.Tensor]:
         if self.model.training:
             raise RuntimeError("VisionSession.query is only allowed when model is in eval mode")
         if torch.is_grad_enabled():
             raise RuntimeError("VisionSession.query requires torch.no_grad() to be active")
         if self.prompt is None or self.episode_id is None:
             raise RuntimeError("VisionSession not initialized. Call reset() first.")
-        if len(self._cache) == 0:
+        frames = self.snapshot(upto_frame_id)
+        if len(frames) == 0:
             raise RuntimeError("Cannot query an empty VisionSession")
         if self._model_revision != self.model._revision:
             raise RuntimeError("VisionSession invalidated due to model revision change")
 
-        return self.model.read_memory(tuple(self._cache), self.prompt)
+        frame_ids = [frame.frame_id for frame in frames]
+        times = [frame.observation_time for frame in frames]
+        if all(t is not None for t in times):
+            return self.model.read_memory(
+                frames,
+                self.prompt,
+                frame_ids=frame_ids,
+                observation_times=[float(t) for t in times if t is not None],
+            )
+        return self.model.read_memory(frames, self.prompt, frame_ids=frame_ids)
 
     @property
     def frames(self) -> Tuple[FrameKV, ...]:
-        return tuple(self._cache)
+        with self._lock:
+            return tuple(self._cache)
+
+
+class FrameKVSession(VisionSession):
+    """Unbounded episode-scoped projected-frame session for consume planning."""
+
+    def __init__(self, model: MossInternVL):
+        super().__init__(model, max_frames=None)
+
+    def reset(self, episode_id: str, prompt: str) -> None:
+        # The async vision worker may be using the model tokenizer while a new
+        # episode is reset.  Prompt-length validation belongs to the native
+        # fuser; avoid a second concurrent tokenizer call here.
+        if not isinstance(episode_id, str) or not episode_id.strip():
+            raise ValueError("episode_id must be non-empty string")
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise ValueError("Prompt must be non-empty string")
+        with self._lock:
+            self._cache.clear()
+            self.episode_id = episode_id.strip()
+            self.prompt = prompt.strip()
+            self._model_revision = self.model._revision

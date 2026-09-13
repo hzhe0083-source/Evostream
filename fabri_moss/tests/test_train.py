@@ -79,6 +79,49 @@ def test_flow_kd_loss_noise_time_and_frozen_teacher():
         assert p.grad is None
 
 
+def test_flow_kd_loss_execution_prefix_weight_and_valid_lengths():
+    class FixedHead(torch.nn.Module):
+        def __init__(self, late_value):
+            super().__init__()
+            self.late_value = late_value
+
+        def _predict_velocity(self, fused_tokens, state, noisy_actions, t, shallow_tokens=None):
+            h = noisy_actions.shape[1]
+            step = torch.arange(h, device=noisy_actions.device).view(1, h, 1)
+            return torch.where(
+                step < 5,
+                torch.ones_like(noisy_actions),
+                torch.full_like(noisy_actions, self.late_value),
+            )
+
+    kwargs = dict(
+        student_head=FixedHead(3.0),
+        teacher_head=FixedHead(0.0),
+        student_deep=torch.zeros(1, 1, 1),
+        student_shallow=None,
+        teacher_deep=torch.zeros(1, 1, 1),
+        teacher_shallow=None,
+        state=torch.zeros(1, 1),
+        actions=torch.zeros(1, 10, 1),
+        action_mask=torch.ones(1, 10, 1),
+        fixed_noise=torch.zeros(1, 10, 1),
+        fixed_t=torch.tensor([0.5]),
+        execution_horizon=5,
+    )
+    weighted = compute_flow_kd_loss(**kwargs)
+    # (5*4*1^2 + 5*1*3^2) / (5*4 + 5*1) = 2.6
+    assert torch.isclose(weighted[1], torch.tensor(2.6), atol=1e-6)
+    # The teacher emits the same unit prefix, so KD only sees the late 3.0
+    # error: (5*1*3^2)/(5*4 + 5*1) = 1.8.
+    assert torch.isclose(weighted[2], torch.tensor(1.8), atol=1e-6)
+
+    uniform = compute_flow_kd_loss(**{k: v for k, v in kwargs.items() if k != "execution_horizon"})
+    assert torch.isclose(uniform[1], torch.tensor(5.0), atol=1e-6)
+
+    tail_masked = compute_flow_kd_loss(**kwargs, valid_action_lengths=[2])
+    assert torch.isclose(tail_masked[1], torch.tensor(1.0), atol=1e-6)
+
+
 def test_adapter_checkpoint_roundtrip_and_strict_rejections():
     policy = TinyFabriVLAPolicy(num_layers=14)
     moss_config = MossConfig(

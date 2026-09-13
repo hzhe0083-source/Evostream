@@ -32,6 +32,62 @@ def compute_file_sha256(file_path: Union[str, Path]) -> str:
     return h.hexdigest()
 
 
+def _action_time_weights(
+    actions: torch.Tensor,
+    execution_horizon: Optional[int] = None,
+    supplied: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Return weights broadcastable to ``[batch, horizon, action_dim]``.
+
+    ``None`` keeps the pre-cadence uniform loss; an explicit execution horizon
+    applies the 4x prefix weighting.
+    """
+    if actions.ndim != 3:
+        raise ValueError(f"actions must have shape [batch, horizon, action_dim], got {tuple(actions.shape)}")
+    if isinstance(execution_horizon, torch.Tensor):
+        if execution_horizon.numel() != 1:
+            raise ValueError("execution_horizon must be scalar")
+        execution_horizon = int(execution_horizon.item())
+    if execution_horizon is not None and (type(execution_horizon) is not int or execution_horizon < 1):
+        raise ValueError("execution_horizon must be a positive integer or None")
+
+    b, h, _ = actions.shape
+    if supplied is None:
+        weights = torch.ones((1, h, 1), device=actions.device, dtype=actions.dtype)
+        if execution_horizon is not None:
+            weights[:, : min(execution_horizon, h), :] = 4.0
+        return weights
+
+    weights = torch.as_tensor(supplied, device=actions.device, dtype=actions.dtype)
+    if weights.ndim == 0:
+        weights = weights.reshape(1, 1, 1)
+    elif weights.ndim == 1:
+        if weights.numel() != h:
+            raise ValueError(f"action time weights length {weights.numel()} != horizon {h}")
+        weights = weights.reshape(1, h, 1)
+    elif weights.ndim == 2:
+        if weights.shape == (b, h):
+            weights = weights.unsqueeze(-1)
+        elif weights.shape == (h, actions.shape[2]):
+            weights = weights.unsqueeze(0)
+        elif weights.shape[-1] == h:
+            weights = weights.unsqueeze(-1)
+        else:
+            raise ValueError(
+                f"2D action time weights must have shape [horizon, action_dim] or [batch, horizon], got {tuple(weights.shape)}"
+            )
+    elif weights.ndim != 3:
+        raise ValueError(f"action time weights must be 1D, 2D, or 3D, got ndim={weights.ndim}")
+
+    if weights.shape[0] not in (1, b) or weights.shape[1] not in (1, h) or weights.shape[2] not in (1, actions.shape[2]):
+        raise ValueError(
+            f"action time weights shape {tuple(weights.shape)} is not broadcastable to {tuple(actions.shape)}"
+        )
+    if not torch.isfinite(weights).all() or (weights < 0).any():
+        raise ValueError("action time weights must be finite and non-negative")
+    return weights
+
+
 def compute_flow_kd_loss(
     student_head: torch.nn.Module,
     teacher_head: torch.nn.Module,
@@ -45,9 +101,46 @@ def compute_flow_kd_loss(
     kd_weight: float = 1.0,
     fixed_noise: Optional[torch.Tensor] = None,
     fixed_t: Optional[torch.Tensor] = None,
+    action_time_weights: Optional[torch.Tensor] = None,
+    valid_action_lengths: Optional[torch.Tensor] = None,
+    execution_horizon: Optional[int] = None,
+    time_weights: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    valid = action_mask
-    if valid.sum() == 0:
+    if time_weights is not None:
+        if action_time_weights is not None:
+            raise ValueError("Pass only one of action_time_weights and time_weights")
+        action_time_weights = time_weights
+
+    if actions.ndim != 3 or action_mask.shape != actions.shape:
+        raise ValueError(
+            f"actions and action_mask must have identical [batch, horizon, action_dim] shapes; "
+            f"got {tuple(actions.shape)} and {tuple(action_mask.shape)}"
+        )
+    valid = action_mask.to(device=actions.device, dtype=actions.dtype)
+    if not torch.isfinite(valid).all() or (valid < 0).any():
+        raise ValueError("action_mask must be finite and non-negative")
+
+    if valid_action_lengths is not None:
+        lengths = torch.as_tensor(valid_action_lengths, device=actions.device)
+        if lengths.ndim == 0:
+            lengths = lengths.reshape(1)
+        lengths = lengths.reshape(-1)
+        if lengths.numel() == 1 and actions.shape[0] != 1:
+            lengths = lengths.expand(actions.shape[0])
+        if lengths.numel() != actions.shape[0] or (lengths < 0).any() or (lengths > actions.shape[1]).any():
+            raise ValueError(
+                f"valid_action_lengths must contain one integer in [0, {actions.shape[1]}] per batch item"
+            )
+        if lengths.dtype.is_floating_point and not torch.equal(lengths, lengths.round()):
+            raise ValueError("valid_action_lengths must contain integers")
+        lengths = lengths.to(dtype=torch.long)
+        time_valid = torch.arange(actions.shape[1], device=actions.device).view(1, -1) < lengths.view(-1, 1)
+        valid = valid * time_valid.unsqueeze(-1).to(dtype=actions.dtype)
+
+    weights = _action_time_weights(actions, execution_horizon, action_time_weights)
+    weighted_valid = valid * weights
+    denominator = weighted_valid.sum()
+    if denominator <= 0:
         raise ValueError("action_mask has sum 0; cannot compute flow loss.")
 
     actions_masked = actions * valid
@@ -58,7 +151,11 @@ def compute_flow_kd_loss(
         noise = (torch.rand_like(actions_masked) * 2.0 - 1.0) * valid
 
     if fixed_t is not None:
-        t = fixed_t.to(device=actions.device, dtype=actions.dtype)
+        t = fixed_t.to(device=actions.device, dtype=actions.dtype).reshape(-1)
+        if t.numel() == 1 and actions.shape[0] != 1:
+            t = t.expand(actions.shape[0])
+        if t.numel() != actions.shape[0]:
+            raise ValueError(f"fixed_t must contain one value per batch item, got {t.numel()} for batch {actions.shape[0]}")
     else:
         b = actions.shape[0]
         alpha = torch.tensor(2.0, device=actions.device)
@@ -94,10 +191,10 @@ def compute_flow_kd_loss(
         raise FloatingPointError("Non-finite values detected in teacher predicted velocity!")
 
     gt_diff = (v_student - target_velocity) * valid
-    gt_loss = (gt_diff ** 2).sum() / valid.sum().clamp_min(1.0)
+    gt_loss = (gt_diff ** 2 * weights).sum() / denominator
 
     kd_diff = (v_student - v_teacher.detach()) * valid
-    kd_loss = (kd_diff ** 2).sum() / valid.sum().clamp_min(1.0)
+    kd_loss = (kd_diff ** 2 * weights).sum() / denominator
 
     total_loss = gt_loss + kd_weight * kd_loss
     if not torch.isfinite(total_loss):
@@ -130,6 +227,25 @@ def train_single_step(
 
     actions = batch["actions"].to(device)
     action_mask = batch["action_mask"].to(device)
+    if actions.numel() == 0 or action_mask.numel() == 0 or not bool(action_mask.any().item()):
+        # Cadence chunks may contain observations between phase-zero decisions.
+        # Keep them in the stream, but do not invent a gradient target.
+        return {
+            "loss": 0.0,
+            "gt_loss": 0.0,
+            "kd_loss": 0.0,
+            "grad_norm": 0.0,
+            "kv_grads": {},
+            "skipped": True,
+            "execution_horizon": batch.get("execution_horizon"),
+            "valid_action_lengths": batch.get("valid_action_lengths", []),
+        }
+
+    execution_horizon = batch.get("execution_horizon")
+    if isinstance(execution_horizon, torch.Tensor):
+        if execution_horizon.numel() != 1:
+            raise ValueError("batch execution_horizon must be scalar")
+        execution_horizon = int(execution_horizon.item())
 
     student_deep, student_shallow = student_model(
         images_window=images_window,
@@ -168,6 +284,9 @@ def train_single_step(
         kd_weight=kd_weight,
         fixed_noise=fixed_noise,
         fixed_t=fixed_t,
+        action_time_weights=batch.get("action_time_weights", batch.get("time_weights")),
+        valid_action_lengths=batch.get("valid_action_lengths"),
+        execution_horizon=execution_horizon,
     )
 
     loss.backward()
@@ -194,6 +313,9 @@ def train_single_step(
         "kd_loss": float(kd_loss.item()),
         "grad_norm": float(grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm),
         "kv_grads": kv_grads,
+        "skipped": False,
+        "execution_horizon": execution_horizon,
+        "valid_action_lengths": batch.get("valid_action_lengths", []),
     }
 
 
@@ -535,8 +657,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--kd-weight", type=float, default=1.0, help="Weight for KD loss term (>= 0)")
     parser.add_argument("--window", type=int, default=2, help="Visual observation window size (>= 1)")
     parser.add_argument("--frame-stride", type=int, default=5, help="Observation frame stride (>= 1)")
-    parser.add_argument("--context-mode", type=str, default="window", choices=["window", "consume"], help="Context frame selection mode")
+    parser.add_argument("--context-mode", type=str, default="window", choices=["window", "consume", "causal"], help="Context frame selection mode")
     parser.add_argument("--min-context-frames", type=int, default=1, help="Minimum context frames in consume mode (>= 1)")
+    parser.add_argument("--decision-stride", type=int, default=None, help="Optional episode-global decision cadence in frames (e.g. 5)")
+    parser.add_argument("--execution-horizon", type=int, default=5, help="Executed action prefix used for weighting (>= 1)")
     parser.add_argument("--num-readout-tokens", type=int, default=16, help="Number of readout tokens (>= 1)")
     parser.add_argument("--seed", type=int, default=4042, help="Random seed")
     parser.add_argument("--max-episodes", type=int, default=None, help="Max episodes to load")
@@ -566,6 +690,10 @@ def main():
         raise ValueError(f"--window must be >= 1, got {args.window}")
     if args.frame_stride <= 0:
         raise ValueError(f"--frame-stride must be >= 1, got {args.frame_stride}")
+    if args.decision_stride is not None and args.decision_stride <= 0:
+        raise ValueError(f"--decision-stride must be >= 1, got {args.decision_stride}")
+    if args.execution_horizon <= 0:
+        raise ValueError(f"--execution-horizon must be >= 1, got {args.execution_horizon}")
     if args.num_readout_tokens <= 0:
         raise ValueError(f"--num-readout-tokens must be >= 1, got {args.num_readout_tokens}")
     if args.save_every <= 0:
@@ -647,23 +775,11 @@ def main():
         max_episodes=args.max_episodes,
         context_mode=args.context_mode,
         min_context_frames=args.min_context_frames,
+        decision_stride=args.decision_stride,
+        execution_horizon=args.execution_horizon,
     )
 
-    data_contract = {
-        "context_mode": args.context_mode,
-        "window": args.window,
-        "frame_stride": args.frame_stride,
-        "min_context_frames": args.min_context_frames,
-        "seed": args.seed,
-        "max_episodes": args.max_episodes,
-        "split": "train",
-        "active_episode_ids": sorted([int(ep["episode_index"]) for ep in dataset.active_episodes]),
-        "metadata_files_sha256": {
-            "info.json": compute_file_sha256(dataset.root / "meta" / "info.json"),
-            "tasks.jsonl": compute_file_sha256(dataset.root / "meta" / "tasks.jsonl"),
-            "episodes.jsonl": compute_file_sha256(dataset.root / "meta" / "episodes.jsonl"),
-        },
-    }
+    data_contract = dataset.get_data_contract()
 
     start_step = 0
     if args.resume:
@@ -688,9 +804,23 @@ def main():
     chosen_sample_idx = args.sample_index
     if args.fixed_sample and chosen_sample_idx is None:
         if args.context_mode == "consume":
-            lens = [len(h) for h in dataset._consume_histories]
-            max_len = max(lens)
-            chosen_sample_idx = lens.index(max_len)
+            histories = dataset._consume_histories
+            if args.decision_stride is not None:
+                candidates = [
+                    i for i, chunk in enumerate(histories)
+                    if any(row % args.decision_stride == 0 for row in chunk)
+                ]
+                chosen_sample_idx = candidates[0] if candidates else 0
+            else:
+                lens = [len(h) for h in histories]
+                max_len = max(lens)
+                chosen_sample_idx = lens.index(max_len)
+        elif args.context_mode == "causal" and args.decision_stride is not None:
+            candidates = [
+                i for i, chunk in enumerate(dataset._causal_chunks)
+                if any(row % args.decision_stride == 0 for row in chunk)
+            ]
+            chosen_sample_idx = candidates[0] if candidates else 0
         else:
             chosen_sample_idx = min(args.frame_stride, len(dataset) - 1)
 
@@ -728,6 +858,10 @@ def main():
             "episode_id": batch.get("episode_id"),
             "frame_ids": batch.get("frame_ids"),
             "context_mode": batch.get("context_mode"),
+            "decision_stride": batch.get("decision_stride", data_contract.get("decision_stride")),
+            "execution_horizon": batch.get("execution_horizon", data_contract.get("execution_horizon")),
+            "valid_action_lengths": batch.get("valid_action_lengths"),
+            "time_source": batch.get("time_source"),
             "loss": metrics["loss"],
             "gt_loss": metrics["gt_loss"],
             "kd_loss": metrics["kd_loss"],

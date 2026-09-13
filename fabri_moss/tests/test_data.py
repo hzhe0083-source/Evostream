@@ -152,7 +152,8 @@ def test_real_server_templates_and_end_to_end_dataset(monkeypatch):
         assert sample["state_mask"][0, 4:].sum() == 0
         assert sample["actions"].shape == (1, 50, 24)
         assert sample["action_mask"].shape == (1, 50, 24)
-        assert sample["action_mask"][0, :, :4].sum() == 50 * 4
+        valid_len = sample["valid_action_lengths"][0]
+        assert sample["action_mask"][0, :, :4].sum() == valid_len * 4
         assert sample["action_mask"][0, :, 4:].sum() == 0
         assert len(sample["frame_ids"]) == 1
         assert sample["frame_ids"][0] == 0
@@ -277,6 +278,35 @@ def test_causal_chunk_returns_all_targets_and_no_future(monkeypatch):
             for group, count in zip(sample["replay_groups"], visible):
                 assert group["observation_indices"] == list(range(count))
                 assert max(group["observation_indices"]) < len(sample["frame_ids"])
+
+        cadence = MetaWorldWindows(
+            root=root,
+            norm_stats=stats,
+            split="all",
+            context_mode="causal",
+            window=3,
+            min_context_frames=2,
+            frame_stride=5,
+            decision_stride=5,
+            horizon=5,
+            state_dim=4,
+            action_dim=4,
+            seed=7,
+        )
+        all_frames = []
+        all_targets = []
+        for sample in (cadence[i] for i in range(len(cadence))):
+            all_frames.extend(sample["frame_ids"])
+            all_targets.extend(sample["target_frame_ids"])
+            for group in sample["replay_groups"]:
+                target_pos = group["target_positions"][0]
+                assert max(group["observation_indices"]) <= sample["target_indices"][target_pos]
+        assert sorted(all_frames) == list(range(7))
+        assert sorted(all_targets) == [0, 5]
+        tail = next(cadence[i] for i in range(len(cadence)) if 5 in cadence[i]["target_frame_ids"])
+        target_pos = tail["target_frame_ids"].index(5)
+        assert tail["valid_action_lengths"][target_pos] == 2
+        assert tail["action_time_mask"][target_pos].tolist() == [1, 1, 0, 0, 0]
 
 
 @pytest.mark.parametrize(

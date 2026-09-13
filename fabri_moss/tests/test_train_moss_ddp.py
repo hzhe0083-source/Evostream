@@ -7,6 +7,13 @@ import torch
 import fabri_moss.train_moss_ddp as trainer
 
 
+def test_stage_epoch_defaults_are_absolute_targets():
+    bridge = trainer.parse_args(["--data-root", "data", "--output-dir", "out", "--stage", "bridge"])
+    joint = trainer.parse_args(["--data-root", "data", "--output-dir", "out", "--stage", "joint"])
+    assert bridge.epochs == 1
+    assert joint.epochs == 2
+
+
 def test_chunk_targets_share_encoding_and_read_only_prefixes(monkeypatch):
     weight = torch.nn.Parameter(torch.tensor(2.0))
     seen, encoded, states = [], [], []
@@ -73,3 +80,61 @@ def test_resume_rejects_writer_checkpoint(tmp_path):
     torch.save({'format': 'predictive_adapter_v1'}, path)
     with pytest.raises(ValueError, match='moss_cross_adapter_v2'):
         trainer._load_resume(path, _Model(), None, SimpleNamespace(stage='bridge'), {}, {}, 1)
+
+
+def test_joint_surface_is_action_head_plus_fp32_qkvo_lora():
+    from fabri_moss.core import MossConfig, MossInternVL
+    from fabri_moss.tests.test_core import TinyFabriVLAPolicy
+
+    policy = TinyFabriVLAPolicy(hidden_size=128, num_layers=6)
+    model = MossInternVL(policy, MossConfig(cross_layers=(2, 4, 6), max_frames=3))
+    args = SimpleNamespace(lora_rank=8, lora_alpha=16.0, lora_dropout=0.1)
+    modules = trainer.configure_lora(model, args)
+    model.set_training_stage("joint")
+    trainable = trainer.configure_trainable_parameters(model, "joint")
+
+    assert len(modules) == 12  # 3 MOSS layers x q/k/v/o
+    assert all(m.rank == 8 and m.alpha == 16.0 and m.dropout_p == 0.1 for m in modules.values())
+    assert all(p.dtype == torch.float32 for p in trainable)
+    names = trainer._trainable_names(model)
+    assert names and all(("action_head" in n or ".lora_" in n) for n in names)
+    assert not any(".base." in n for n in names)
+    assert not any("cross_blocks" in n or "readout_embeddings" in n for n in names)
+
+
+def test_joint_checkpoint_roundtrip_restores_lora_without_base_policy(tmp_path):
+    from fabri_moss.core import MossConfig, MossInternVL
+    from fabri_moss.tests.test_core import TinyFabriVLAPolicy
+
+    def make_model():
+        model = MossInternVL(
+            TinyFabriVLAPolicy(hidden_size=128, num_layers=6),
+            MossConfig(cross_layers=(2, 4, 6), max_frames=3),
+        )
+        trainer.configure_lora(model, SimpleNamespace(lora_rank=8, lora_alpha=16.0, lora_dropout=0.1))
+        model.set_training_stage("joint")
+        trainer.configure_trainable_parameters(model, "joint")
+        return model
+
+    args = SimpleNamespace(
+        stage="joint", epochs=2, global_batch_size=2, seed=7,
+        context_mode="causal", window=3, frame_stride=1,
+        min_context_frames=1, decision_stride=None, execution_horizon=5,
+        lr=1e-4, action_lr=1e-5, base_lr=5e-6, kd_weight=1.0,
+        grad_clip_norm=1.0,
+    )
+    model = make_model()
+    optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=1e-3)
+    path = tmp_path / "joint.pt"
+    contract = {"context_mode": "causal", "data_fingerprint": "x"}
+    meta = {"checkpoint_sha256": "base"}
+    trainer._save(path, model, optimizer, 3, 1, 0, 0, args, {}, meta, contract, 1, trainer._rng_states(1, "cpu"))
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    assert "lora_state" in payload and "base_policy" not in payload
+
+    clone = make_model()
+    clone_opt = torch.optim.AdamW([p for p in clone.parameters() if p.requires_grad], lr=9e-3)
+    restored = trainer._load_resume(path, clone, clone_opt, args, meta, contract, 1)
+    assert restored == (3, 1, 0, 0)
+    for key, value in trainer.lora_state_dict(clone.policy).items():
+        assert torch.equal(value, payload["lora_state"][key])

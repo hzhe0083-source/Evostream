@@ -374,6 +374,43 @@ def test_make_moss_callbacks_with_tiny_moss():
         assert res.computation.shallow is not None
 
 
+def test_moss_consume_session_persists_history_and_resets():
+    """Consume callbacks append projected frames once and read the full episode prefix."""
+    policy = TinyFabriVLAPolicy(hidden_size=128, num_layers=6)
+    policy.action_head = TinyActionExpertWithSample(hidden_size=128, action_dim=4, horizon=2)
+    moss = MossInternVL(
+        policy,
+        config=MossConfig(cross_layers=(2, 4, 6), num_readout_tokens=8, max_frames=2, shallow_layer=4),
+    )
+    moss.eval()
+    encode_fn, plan_fn, validate_fn = make_moss_callbacks(moss)
+    read_ids = []
+    original_read = moss.read_memory
+
+    def spy_read(frames, prompt, **kwargs):
+        read_ids.append([frame.frame_id for frame in frames])
+        return original_read(frames, prompt, **kwargs)
+
+    moss.read_memory = spy_read
+    with AsyncVisualPlanner(encode_fn, plan_fn, max_frames=2, validate=validate_fn) as planner:
+        planner.reset("consume_ep", "move arm")
+        planner.submit(make_obs(0, capture_time=0.0))
+        planner.submit(make_obs(1, capture_time=0.1))
+        assert planner.wait_ready(min_frames=2, timeout=5.0)
+        assert planner.request_plan()
+        assert planner.wait_plan(timeout=10.0) is not None
+
+        planner.submit(make_obs(2, capture_time=0.2))
+        assert planner.wait_ready(min_frames=1, timeout=5.0)
+        assert planner.request_plan()
+        assert planner.wait_plan(timeout=10.0) is not None
+
+        assert read_ids == [[0, 1], [0, 1, 2]]
+        assert planner.stats()["memory_frame_count"] == 3
+        planner.reset("consume_ep_new", "move arm")
+        assert planner.stats()["memory_frame_count"] == 0
+
+
 def test_close_cleanly_terminates_threads():
     planner = AsyncVisualPlanner(lambda obs: "p", lambda f, p: PlanComputation(actions=torch.zeros((1, 1, 1))))
     planner.reset(episode_id="ep", prompt="prompt")

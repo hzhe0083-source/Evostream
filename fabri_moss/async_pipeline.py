@@ -11,7 +11,7 @@ import torch
 import numpy as np
 from PIL import Image
 
-from fabri_moss.core import FrameKV, MossInternVL
+from fabri_moss.core import FrameKV, FrameKVSession, MossInternVL
 from fabri_moss.delta import DeltaMemoryState
 
 
@@ -219,6 +219,8 @@ class AsyncVisualPlanner:
         memory_validator: Optional[Callable[[Any, Optional[Any], Tuple[EncodedFrame, ...], str], Any]] = None,
         max_ready: Optional[int] = None,
         overflow_policy: str = "drop_oldest",
+        reset_hook: Optional[Callable[[str, str], None]] = None,
+        frame_commit_hook: Optional[Callable[[EncodedFrame], None]] = None,
     ) -> None:
         if max_frames is not None:
             if type(max_frames) is bool or not (isinstance(max_frames, int) and max_frames > 0):
@@ -249,6 +251,17 @@ class AsyncVisualPlanner:
         self.validate_fn = validate
         self.stateful = bool(stateful)
         self.memory_validator = memory_validator
+        # Optional lifecycle hooks are intentionally tiny: they let a consume
+        # callback own an episode session without changing the old callback
+        # signatures.  Function attributes provide automatic wiring from
+        # ``make_moss_callbacks``; explicit arguments win for custom callers.
+        self.reset_hook = reset_hook or getattr(plan, "reset_session", None) or getattr(plan, "reset", None)
+        self.frame_commit_hook = (
+            frame_commit_hook
+            or getattr(plan, "commit_frame", None)
+            or getattr(plan, "append_frame", None)
+        )
+        self._frame_session = getattr(plan, "frame_session", None)
 
         self._lock = threading.Lock()
         self._cv = threading.Condition(self._lock)
@@ -358,6 +371,10 @@ class AsyncVisualPlanner:
                     "timestamp": time.monotonic(),
                 }
             )
+            if self.reset_hook is not None:
+                # Clear callback-owned episode state before any new-generation
+                # observation can be committed.
+                self.reset_hook(self._episode_id, self._prompt)
             self._cv.notify_all()
 
     def submit(self, observation: Observation) -> bool:
@@ -675,6 +692,20 @@ class AsyncVisualPlanner:
             mem_frame_count = getattr(self._memory, "frame_count", 0)
             mem_last_id = getattr(self._memory, "last_frame_id", -1)
             mem_bytes = getattr(self._memory, "nbytes", 0)
+            if self._frame_session is not None:
+                session_lock = getattr(self._frame_session, "_lock", None)
+                if session_lock is None:
+                    session_frames = tuple(getattr(self._frame_session, "frames", ()))
+                else:
+                    with session_lock:
+                        session_frames = tuple(getattr(self._frame_session, "frames", ()))
+                mem_frame_count = len(session_frames)
+                mem_last_id = session_frames[-1].frame_id if session_frames else -1
+                mem_bytes = sum(
+                    int(t.numel() * t.element_size())
+                    for f in session_frames
+                    for t in (*f.keys, *f.values)
+                )
 
             return {
                 "generation": self._generation,
@@ -716,6 +747,13 @@ class AsyncVisualPlanner:
         with self._cv:
             self._closed = True
             self._memory = None
+            if self._frame_session is not None and hasattr(self._frame_session, "clear"):
+                session_lock = getattr(self._frame_session, "_lock", None)
+                if session_lock is None:
+                    self._frame_session.clear()
+                else:
+                    with session_lock:
+                        self._frame_session.clear()
             self._pending_raw.clear()
             self._ready.clear()
             self._reservation = None
@@ -801,6 +839,30 @@ class AsyncVisualPlanner:
                     self._cv.notify_all()
                     continue
 
+                if self.frame_commit_hook is not None:
+                    try:
+                        # Commit exactly once, after generation fencing and
+                        # before publishing the frame as ready.  A retry then
+                        # reuses the reservation instead of appending again.
+                        with torch.no_grad():
+                            self.frame_commit_hook(encoded_frame)
+                    except BaseException as hook_exc:
+                        self._vision_error = hook_exc
+                        self._errors_count += 1
+                        self._events.append(
+                            {
+                                "type": "vision_commit_error",
+                                "thread_id": th_id,
+                                "frame_id": encoded_frame.observation.frame_id,
+                                "generation": gen,
+                                "error": str(hook_exc),
+                                "timestamp": time.monotonic(),
+                            }
+                        )
+                        encoded_frame = None
+                        self._cv.notify_all()
+                        continue
+
                 self._last_encoded_id = encoded_frame.observation.frame_id
                 self._encoded_count += 1
 
@@ -874,13 +936,18 @@ class AsyncVisualPlanner:
 
                 # In stateful mode, candidate next_memory is prepared via custom validator or default Delta validator
                 if self.stateful:
-                    validator = self.memory_validator or _validate_next_memory
-                    prepared_memory = validator(
-                        plan_comp.next_memory,
-                        current_mem,
-                        snapshot,
-                        prompt,
-                    )
+                    if self._frame_session is not None and plan_comp.next_memory is None:
+                        # Consume sessions are committed at encode time and do
+                        # not return a DeltaMemoryState candidate.
+                        prepared_memory = current_mem
+                    else:
+                        validator = self.memory_validator or _validate_next_memory
+                        prepared_memory = validator(
+                            plan_comp.next_memory,
+                            current_mem,
+                            snapshot,
+                            prompt,
+                        )
 
                 if self.validate_fn is not None:
                     self.validate_fn()
@@ -1026,6 +1093,62 @@ def make_moss_callbacks(
         vision_stream = None
         planner_stream = None
 
+    memory_mode = getattr(model.config, "memory_mode", "consume")
+    consume_session = FrameKVSession(model) if memory_mode == "consume" else None
+    consume_lock = threading.RLock()
+
+    def reset_session(episode_id: str, prompt: str) -> None:
+        if consume_session is not None:
+            with consume_lock:
+                consume_session.reset(episode_id, prompt)
+
+    def commit_frame(encoded: EncodedFrame) -> None:
+        if consume_session is None:
+            return
+        if not isinstance(encoded.payload, FrameKV):
+            raise TypeError(
+                f"consume callback payload must be FrameKV, got {type(encoded.payload).__name__}"
+            )
+        with consume_lock:
+            consume_session.append_frame(encoded.payload)
+
+    def consume_snapshot(frames: Tuple[EncodedFrame, ...], prompt: str) -> Tuple[FrameKV, ...]:
+        if consume_session is None:
+            return tuple(f.payload for f in frames)
+        cutoff = frames[-1].observation.frame_id
+        with consume_lock:
+            direct_mode = False
+            if consume_session.episode_id is None:
+                # Direct callback callers do not have an AsyncVisualPlanner to
+                # invoke the lifecycle hook; initialize a private episode.
+                consume_session.reset("direct", prompt)
+                direct_mode = True
+            elif consume_session.prompt != prompt.strip():
+                raise ValueError(
+                    f"consume session prompt {consume_session.prompt!r} does not match active prompt {prompt.strip()!r}"
+                )
+            # A direct invocation may bypass the commit hook.  Append only
+            # unseen payloads, preserving the exactly-once invariant.
+            known_ids = {f.frame_id for f in consume_session.frames}
+            for encoded in frames:
+                if not isinstance(encoded.payload, FrameKV):
+                    raise TypeError(
+                        f"consume callback payload must be FrameKV, got {type(encoded.payload).__name__}"
+                    )
+                if encoded.payload.frame_id not in known_ids:
+                    if not direct_mode:
+                        raise RuntimeError(
+                            f"frame_id={encoded.payload.frame_id} was not committed to the active consume session"
+                        )
+                    consume_session.append_frame(encoded.payload)
+                    known_ids.add(encoded.payload.frame_id)
+            history = consume_session.snapshot(cutoff)
+        if not history or history[-1].frame_id != cutoff:
+            raise RuntimeError(
+                f"consume session has no complete history through frame_id={cutoff}"
+            )
+        return history
+
     def validate() -> None:
         if model.training:
             raise RuntimeError("MossInternVL model must be in eval mode for AsyncVisualPlanner")
@@ -1042,8 +1165,13 @@ def make_moss_callbacks(
                     features = model.encode_image(list(obs.images))
                     frame_kv = model.project_frame(
                         features, frame_id=obs.frame_id,
-                        observation_time=obs.observation_time,
+                        # Delta's historical contract never included the
+                        # optional metadata token; retain it for consume while
+                        # still recording the observation time on the frame.
+                        observation_time=obs.observation_time if memory_mode == "consume" else None,
                     )
+                    if memory_mode == "delta" and obs.observation_time is not None:
+                        frame_kv = dataclasses.replace(frame_kv, observation_time=obs.observation_time)
                     completion_event = torch.cuda.Event()
                     completion_event.record(vision_stream)
                     completion_event.synchronize()
@@ -1051,8 +1179,10 @@ def make_moss_callbacks(
                 features = model.encode_image(list(obs.images))
                 frame_kv = model.project_frame(
                     features, frame_id=obs.frame_id,
-                    observation_time=obs.observation_time,
+                    observation_time=obs.observation_time if memory_mode == "consume" else None,
                 )
+                if memory_mode == "delta" and obs.observation_time is not None:
+                    frame_kv = dataclasses.replace(frame_kv, observation_time=obs.observation_time)
         return frame_kv
 
     def plan(
@@ -1062,9 +1192,11 @@ def make_moss_callbacks(
     ) -> PlanComputation:
         validate()
         latest_obs = frames[-1].observation
-        payloads = [f.payload for f in frames]
-
-        memory_mode = getattr(model.config, "memory_mode", "consume")
+        if memory_mode == "consume":
+            read_frames = consume_snapshot(frames, prompt)
+            payloads = list(read_frames)
+        else:
+            payloads = [f.payload for f in frames]
         next_mem_candidate: Optional[Any] = None
 
         with torch.no_grad():
@@ -1095,12 +1227,12 @@ def make_moss_callbacks(
                         deep, shallow = model.read_memory(
                             payloads,
                             prompt,
-                            frame_ids=[f.observation.frame_id for f in frames],
+                            frame_ids=[f.frame_id for f in payloads],
                             observation_times=[
-                                float(f.observation.observation_time)
-                                if f.observation.observation_time is not None
-                                else float(f.observation.frame_id)
-                                for f in frames
+                                float(f.observation_time)
+                                if f.observation_time is not None
+                                else float(f.frame_id)
+                                for f in payloads
                             ],
                         )
                         next_mem_candidate = None
@@ -1130,12 +1262,12 @@ def make_moss_callbacks(
                     deep, shallow = model.read_memory(
                         payloads,
                         prompt,
-                        frame_ids=[f.observation.frame_id for f in frames],
+                        frame_ids=[f.frame_id for f in payloads],
                         observation_times=[
-                            float(f.observation.observation_time)
-                            if f.observation.observation_time is not None
-                            else float(f.observation.frame_id)
-                            for f in frames
+                            float(f.observation_time)
+                            if f.observation_time is not None
+                            else float(f.frame_id)
+                            for f in payloads
                         ],
                     )
                     next_mem_candidate = None
@@ -1157,5 +1289,14 @@ def make_moss_callbacks(
             shallow=shallow_cpu,
             next_memory=next_mem_candidate,
         )
+
+    # AsyncVisualPlanner discovers these optional hooks while retaining the
+    # historical three-callback return shape.
+    if consume_session is not None:
+        plan.reset_session = reset_session  # type: ignore[attr-defined]
+        plan.reset = reset_session  # type: ignore[attr-defined]
+        plan.commit_frame = commit_frame  # type: ignore[attr-defined]
+        plan.append_frame = commit_frame  # type: ignore[attr-defined]
+        plan.frame_session = consume_session  # type: ignore[attr-defined]
 
     return encode, plan, validate
