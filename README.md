@@ -17,6 +17,12 @@
 - 部署使用 `Threading.Lock()` 互斥保护同一个流式 Session，彻底杜绝异步感知追加与规划回滚之间的竞态条件。
 - 所有 MOSS 加载都设置 `local_files_only=True`；这些脚本不会自动下载模型权重。
 
+## 浅层哨兵首批接口（P0–P2）
+
+新增最终执行命令账本、原生 ViT prefix/suffix 续算接口，以及独立的 `extract/train/calibrate/shadow` 离线监控工具。
+**当前 shadow 是离线回放，尚未接入在线事件执行；默认策略与 planner 不变。**
+完整数据合同、运行命令、真实权重验收限制与已有 parity 不稳定项见 [docs/SENTINEL_P0_P2.md](docs/SENTINEL_P0_P2.md)。
+
 ## 根目录入口
 
 ```text

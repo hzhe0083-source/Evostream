@@ -25,6 +25,8 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+from vision_split import EncodedVision
+
 RETAINED_LAYERS = 24
 RETAINED_CROSS_ATTENTION_LAYERS = (2, 6, 10, 14, 18, 22)
 # Only used by the offline parity CLI; the policy reads the final hidden state.
@@ -85,6 +87,14 @@ class MossStreamState:
 
 
 @dataclass(frozen=True)
+class PlanContext:
+    context_tensor: torch.Tensor
+    source_state_time: float
+    source_frame_time: float
+    extraction: str = "mean_action_query_hidden"
+
+
+@dataclass(frozen=True)
 class ActionChunk:
     """One plan: `actions[j]` is meant to execute at `start_time + j * interval`."""
 
@@ -93,6 +103,7 @@ class ActionChunk:
     plan_time: float
     interval: float
     visual_age: float
+    context: PlanContext | None = None
 
 
 @dataclass(frozen=True)
@@ -487,12 +498,45 @@ class TruncatedMossBackbone(nn.Module):
     def append_stream_frame(
         self, state: MossStreamState, frame_inputs: Mapping[str, Any]
     ) -> BackboneTaps:
+        encoded = self.encode_complete_vision(frame_inputs)
+        return self.append_encoded_vision(state, frame_inputs, encoded)
+
+    @torch.no_grad()
+    def encode_complete_vision(self, frame_inputs: Mapping[str, Any]) -> EncodedVision:
+        pixel_values = frame_inputs.get("pixel_values")
+        grid_thw = frame_inputs.get("grid_thw")
+        if pixel_values is None or grid_thw is None:
+            raise ValueError("vision encoding requires pixel_values and grid_thw")
+        vision_method = getattr(self.moss, "get_vision_features_chunked", None)
+        if not callable(vision_method):
+            vision_method = self.moss.get_vision_features
+        states, info = vision_method(
+            pixel_values, grid_thw, frame_inputs.get("media_nums_per_sample")
+        )
+        return EncodedVision(
+            hidden_states=states,
+            token_info=info,
+            grid_thw=grid_thw.clone(),
+            source_core=self.moss,
+        )
+
+    @torch.no_grad()
+    def append_encoded_vision(
+        self, state: MossStreamState, frame_inputs: Mapping[str, Any],
+        encoded: EncodedVision,
+    ) -> BackboneTaps:
+        if not hasattr(encoded, "source_core") or encoded.source_core is not self.moss:
+            raise ValueError(
+                "encoded vision originates from a foreign or missing model core instance; "
+                "same-core identity is strictly required"
+            )
         values = dict(frame_inputs)
         input_ids = values.get("input_ids")
         grid_thw = values.get("grid_thw")
-        pixel_values = values.get("pixel_values")
-        if input_ids is None or grid_thw is None or pixel_values is None:
-            raise ValueError("stream frame requires input_ids, grid_thw, and pixel_values")
+        if input_ids is None or grid_thw is None:
+            raise ValueError("stream frame requires input_ids and grid_thw")
+        if not torch.equal(grid_thw, encoded.grid_thw):
+            raise ValueError("encoded vision grid does not match frame tokens")
         if input_ids.ndim != 2 or input_ids.shape[0] != 1:
             raise ValueError("stream frame input_ids must have shape [1, tokens]")
         if grid_thw.ndim != 2 or grid_thw.shape[1] != 3:
@@ -520,14 +564,7 @@ class TruncatedMossBackbone(nn.Module):
         )
         next_position = int(next_positions[0].item())
 
-        vision_method = getattr(self.moss, "get_vision_features_chunked", None)
-        if not callable(vision_method):
-            vision_method = self.moss.get_vision_features
-        vision_states, current_info = vision_method(
-            pixel_values,
-            grid_thw,
-            values.get("media_nums_per_sample"),
-        )
+        vision_states, current_info = encoded.hidden_states, encoded.token_info
         vision_states = vision_states.to(
             device=input_ids.device,
             dtype=self.moss.get_input_embeddings().weight.dtype,
@@ -969,6 +1006,30 @@ class StreamingMossActionSession:
         self.last_frame_timestamp: float | None = None
         self._lock = threading.Lock()
         self.plan_latency_ema: float = 0.05
+        self._last_committed_frame_id: int | None = None
+
+    def append_preencoded_frame(
+        self, frame_inputs: Mapping[str, Any], encoded: EncodedVision, *,
+        frame_id: int, timestamp: float, origin_timestamp: float,
+    ) -> BackboneTaps:
+        """Commit selected vision; preprocessing timestamps share an episode origin."""
+        with self._lock:
+            if not all(math.isfinite(t) for t in (timestamp, origin_timestamp)):
+                raise ValueError("frame timestamps must be finite")
+            if timestamp < origin_timestamp:
+                raise ValueError("frame timestamp precedes episode origin")
+            if self.origin_timestamp is not None and self.origin_timestamp != origin_timestamp:
+                raise ValueError("preencoded frame has a different episode time origin")
+            if self.last_timestamp is not None and timestamp <= self.last_timestamp:
+                raise ValueError("selected frames must be strictly chronological")
+            if self._last_committed_frame_id is not None and frame_id <= self._last_committed_frame_id:
+                raise ValueError("selected frame IDs must increase without duplicates")
+            taps = self.policy.backbone.append_encoded_vision(self.state, frame_inputs, encoded)
+            self.origin_timestamp = origin_timestamp
+            self.last_timestamp = timestamp
+            self.last_frame_timestamp = timestamp
+            self._last_committed_frame_id = frame_id
+            return taps
 
     def _append_frame(
         self,
@@ -1066,6 +1127,10 @@ class StreamingMossActionSession:
                 plan_time=plan_timestamp,
                 interval=self.policy.config.control_interval,
                 visual_age=visual_age,
+                context=PlanContext(
+                    hidden.mean(dim=1)[0].detach().clone(),
+                    plan_timestamp, self.last_frame_timestamp,
+                ),
             )
 
     @torch.no_grad()

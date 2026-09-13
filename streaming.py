@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import threading
 import time
+from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -18,7 +19,241 @@ __all__ = [
     "ChunkExecutor",
     "AsyncPerception",
     "ChunkPlanner",
+    "ActionRecord",
+    "ExecutedActionLedger",
 ]
+
+
+@dataclass(frozen=True)
+class ActionRecord:
+    """Immutable record of an executed action passed to env.step."""
+
+    action: np.ndarray
+    timestamp: float
+    duration: float
+    step_index: int
+    command_id: int
+    plan_id: str | int | None = None
+    event_epoch: int | None = None
+    fallback: bool = False
+
+    def copy(self) -> ActionRecord:
+        """Return an isolated copy where the action array is fresh."""
+        action = self.action.copy()
+        action.flags.writeable = False
+        return ActionRecord(
+            action=action,
+            timestamp=self.timestamp,
+            duration=self.duration,
+            step_index=self.step_index,
+            command_id=self.command_id,
+            plan_id=self.plan_id,
+            event_epoch=self.event_epoch,
+            fallback=self.fallback,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "action": self.action.tolist(),
+            "timestamp": float(self.timestamp),
+            "duration": float(self.duration),
+            "step_index": int(self.step_index),
+            "command_id": int(self.command_id),
+            "plan_id": self.plan_id,
+            "event_epoch": self.event_epoch,
+            "fallback": bool(self.fallback),
+        }
+
+
+class ExecutedActionLedger:
+    """Bounded, thread-safe ledger of executed robot actions."""
+
+    def __init__(self, capacity: int = 10000) -> None:
+        if capacity <= 0:
+            raise ValueError("capacity must be positive")
+        self.capacity = capacity
+        self._records: deque[ActionRecord] = deque(maxlen=capacity)
+        self._lock = threading.Lock()
+        self._total_recorded = 0
+
+    def record(
+        self,
+        action: np.ndarray,
+        timestamp: float | None = None,
+        duration: float = 0.0,
+        *,
+        step_index: int | None = None,
+        plan_id: str | int | None = None,
+        event_epoch: int | None = None,
+        fallback: bool = False,
+    ) -> ActionRecord:
+        """Record an executed action.
+
+        Validates finite actions, finite timestamps, nonnegative duration,
+        and monotonic, non-overlapping intervals against existing records.
+        """
+        arr = np.asarray(action, dtype=np.float32)
+        if not np.isfinite(arr).all():
+            raise ValueError("action must be finite")
+        t = time.monotonic() if timestamp is None else float(timestamp)
+        if not math.isfinite(t):
+            raise ValueError("timestamp must be finite")
+        dur = float(duration)
+        if not math.isfinite(dur) or dur < 0.0:
+            raise ValueError("duration must be finite and nonnegative")
+
+        # Copy array and set writeable=False for immutability
+        isolated_action = arr.copy()
+        isolated_action.flags.writeable = False
+
+        with self._lock:
+            cmd_id = self._total_recorded
+            idx = cmd_id if step_index is None else int(step_index)
+            if self._records:
+                last = self._records[-1]
+                if t < last.timestamp:
+                    raise ValueError(
+                        f"monotonicity violation: timestamp {t} < last {last.timestamp}"
+                    )
+                if t < last.timestamp + last.duration:
+                    raise ValueError(
+                        f"overlapping boundary: timestamp {t} < last interval end {last.timestamp + last.duration}"
+                    )
+            entry = ActionRecord(
+                action=isolated_action,
+                timestamp=t,
+                duration=dur,
+                step_index=idx,
+                command_id=cmd_id,
+                plan_id=plan_id,
+                event_epoch=event_epoch,
+                fallback=fallback,
+            )
+            self._records.append(entry)
+            self._total_recorded += 1
+            return entry.copy()
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._records)
+
+    @property
+    def total_recorded(self) -> int:
+        with self._lock:
+            return self._total_recorded
+
+    def get_records(self) -> list[ActionRecord]:
+        """Return isolated copies of records to prevent external mutation."""
+        with self._lock:
+            return [r.copy() for r in self._records]
+
+    def query_interval(
+        self, start_time: float, end_time: float
+    ) -> dict[str, Any]:
+        """Query actions active or starting within [start_time, end_time].
+
+        Validates intervals and detects internal gaps via union scan over
+        half-open intervals [t_i, t_i + duration).
+        """
+        start = float(start_time)
+        end = float(end_time)
+        if not math.isfinite(start) or not math.isfinite(end):
+            raise ValueError("query intervals must be finite")
+        if end < start:
+            raise ValueError("end_time must be >= start_time")
+        with self._lock:
+            records = list(self._records)
+            total = self._total_recorded
+
+        if not records:
+            return {
+                "records": [],
+                "covered": False,
+                "truncated": total > 0,
+                "earliest_timestamp": None,
+                "latest_timestamp": None,
+                "earliest_step": None,
+                "latest_step": None,
+            }
+
+        earliest_t = records[0].timestamp
+        latest_t = records[-1].timestamp + records[-1].duration
+        truncated = (total > len(records)) and (start < earliest_t)
+
+        matching: list[ActionRecord] = []
+        matching_intervals: list[tuple[float, float]] = []
+        for r in records:
+            r_start = r.timestamp
+            r_end = r.timestamp + r.duration
+            if r.duration > 0.0:
+                overlaps = (r_start < end) and (r_end > start)
+            else:
+                overlaps = (start <= r_start <= end)
+            if overlaps:
+                matching.append(r.copy())
+                matching_intervals.append((r_start, r_end))
+
+        # Check coverage over [start, end]
+        covered = False
+        if not truncated and start >= earliest_t and end <= latest_t:
+            if start == end:
+                # Point query
+                covered = any(iv[0] <= start <= iv[1] for iv in matching_intervals)
+            elif matching_intervals:
+                # Union scan: merge half-open segments and ensure [start, end] is contiguous without gaps
+                matching_intervals.sort(key=lambda iv: iv[0])
+                cur_cov_start = matching_intervals[0][0]
+                cur_cov_end = matching_intervals[0][1]
+                has_internal_gap = False
+                for iv_s, iv_e in matching_intervals[1:]:
+                    if iv_s > cur_cov_end + 1e-9:  # internal gap found
+                        has_internal_gap = True
+                        break
+                    cur_cov_end = max(cur_cov_end, iv_e)
+                if not has_internal_gap and cur_cov_start <= start + 1e-9 and cur_cov_end >= end - 1e-9:
+                    covered = True
+
+        return {
+            "records": matching,
+            "covered": covered,
+            "truncated": truncated,
+            "earliest_timestamp": records[0].timestamp,
+            "latest_timestamp": records[-1].timestamp,
+            "earliest_step": records[0].step_index,
+            "latest_step": records[-1].step_index,
+        }
+
+    def stats(self) -> dict[str, Any]:
+        with self._lock:
+            count = len(self._records)
+            total = self._total_recorded
+            if count == 0:
+                return {
+                    "total_recorded": total,
+                    "retained_count": 0,
+                    "fallback_count": 0,
+                    "fallback_fraction": 0.0,
+                    "mean_duration": 0.0,
+                }
+            fallback_count = sum(1 for r in self._records if r.fallback)
+            durations = [r.duration for r in self._records]
+            mean_dur = float(np.mean(durations)) if durations else 0.0
+            return {
+                "total_recorded": total,
+                "retained_count": count,
+                "fallback_count": fallback_count,
+                "fallback_fraction": fallback_count / count,
+                "mean_duration": mean_dur,
+            }
+
+    def export(self) -> list[dict[str, Any]]:
+        with self._lock:
+            return [r.to_dict() for r in self._records]
+
+    def clear(self) -> None:
+        with self._lock:
+            self._records.clear()
+            self._total_recorded = 0
 
 
 @dataclass(frozen=True)

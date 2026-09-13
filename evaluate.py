@@ -28,6 +28,7 @@ from streaming import (
     AsyncPerception,
     ChunkExecutor,
     ChunkPlanner,
+    ExecutedActionLedger,
     LatestObservation,
     Observation,
 )
@@ -96,6 +97,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--attention-backend", default="flash_attention_2")
     parser.add_argument("--camera-size", type=int, default=256)
     parser.add_argument("--output", type=Path, default=Path("evaluation.json"))
+    parser.add_argument(
+        "--action-ledger-path",
+        type=Path,
+        default=None,
+        help="optional path to export executed action records (JSON) for offline alignment",
+    )
     args = parser.parse_args()
     if not 1 <= args.trials_per_task <= 50:
         parser.error("--trials-per-task must be in 1..50")
@@ -377,6 +384,7 @@ def _blocking_rollout(
     execute_steps: int,
     ensemble_lambda: float | None,
     control_interval: float,
+    action_ledger: ExecutedActionLedger | None = None,
 ) -> tuple[bool, int, dict[str, Any]]:
     """Receding horizon: replan every `execute_steps` actions, drop the rest."""
     executor = ChunkExecutor(ensemble_lambda=ensemble_lambda)
@@ -409,21 +417,42 @@ def _blocking_rollout(
                 gripper if abs(float(action[-1])) <= 0.2 else float(np.sign(action[-1]))
             )
             action[-1] = gripper
+            # Snapshot action array BEFORE env.step as env.step might mutate the passed array
+            action_snapshot = action.copy()
+            t_step_start = time.monotonic()
             observation, _, done, _ = env.step(action)
+            t_step_end = time.monotonic()
+            if action_ledger is not None:
+                action_ledger.record(
+                    action_snapshot,
+                    timestamp=t_step_start,
+                    duration=t_step_end - t_step_start,
+                    step_index=steps,
+                    plan_id=None,  # Baseline has no 1:1 plan attribution; do not fabricate provenance
+                    event_epoch=0,
+                    fallback=False,
+                )
             steps += 1
             if env.check_success():
-                return True, steps, _chunk_stats(chunks_planned, jumps)
+                return True, steps, _chunk_stats(chunks_planned, jumps, action_ledger)
             if done:
-                return False, steps, _chunk_stats(chunks_planned, jumps)
-    return False, steps, _chunk_stats(chunks_planned, jumps)
+                return False, steps, _chunk_stats(chunks_planned, jumps, action_ledger)
+    return False, steps, _chunk_stats(chunks_planned, jumps, action_ledger)
 
 
-def _chunk_stats(chunks_planned: int, jumps: list[float]) -> dict[str, Any]:
-    return {
+def _chunk_stats(
+    chunks_planned: int,
+    jumps: list[float],
+    action_ledger: ExecutedActionLedger | None = None,
+) -> dict[str, Any]:
+    stats = {
         "chunks_planned": chunks_planned,
         "mean_boundary_jump": float(np.mean(jumps)) if jumps else 0.0,
         "max_boundary_jump": max(jumps, default=0.0),
     }
+    if action_ledger is not None:
+        stats["ledger"] = action_ledger.stats()
+    return stats
 
 
 def _async_rollout(
@@ -434,6 +463,7 @@ def _async_rollout(
     normalization: Mapping[str, Any],
     horizon: int,
     args: argparse.Namespace,
+    action_ledger: ExecutedActionLedger | None = None,
 ) -> tuple[bool, int, dict[str, Any]]:
     period = 1.0 / args.control_hz
     mailbox = LatestObservation()
@@ -467,6 +497,7 @@ def _async_rollout(
     rollout_started = deadline
     try:
         for steps in range(1, horizon + 1):
+            is_fallback = False
             try:
                 action = executor.action_at(time.monotonic()).copy()
             except RuntimeError:
@@ -476,6 +507,7 @@ def _async_rollout(
                     raise
                 stalls += 1
                 action = previous.copy()
+                is_fallback = True
             if previous is not None:
                 jumps.append(float(np.abs(action - previous).max()))
             previous = action.copy()
@@ -485,7 +517,21 @@ def _async_rollout(
                 else float(np.sign(action[-1]))
             )
             action[-1] = gripper
+            # Snapshot action array BEFORE env.step as env.step might mutate the passed array
+            action_snapshot = action.copy()
+            t_step_start = time.monotonic()
             observation, _, done, _ = env.step(action)
+            t_step_end = time.monotonic()
+            if action_ledger is not None:
+                action_ledger.record(
+                    action_snapshot,
+                    timestamp=t_step_start,
+                    duration=t_step_end - t_step_start,
+                    step_index=steps - 1,
+                    plan_id=None,  # In async/ensemble mode, provenance is unknown; do not fabricate
+                    event_epoch=0,
+                    fallback=is_fallback,
+                )
             success = bool(env.check_success())
             if success or done:
                 break
@@ -504,7 +550,7 @@ def _async_rollout(
     perception.raise_if_failed()
     planner.raise_if_failed()
     elapsed = max(time.monotonic() - rollout_started, 1e-6)
-    return success, steps, {
+    metrics = {
         "chunks_planned": planner.chunks_planned,
         "chunk_stalls": stalls,
         "stall_fraction": stalls / max(steps, 1),
@@ -517,6 +563,9 @@ def _async_rollout(
         "frames_encoded": perception.frames_encoded,
         "perception_frequency_hz": perception.frames_encoded / elapsed,
     }
+    if action_ledger is not None:
+        metrics["ledger"] = action_ledger.stats()
+    return success, steps, metrics
 
 
 def main() -> None:
@@ -550,6 +599,7 @@ def main() -> None:
         )
     records = []
     per_task_success = []
+    all_exported_ledger_records: list[dict[str, Any]] = []
     for task_id in args.task_ids:
         task = suite.get_task(task_id)
         env = OffScreenRenderEnv(
@@ -585,6 +635,11 @@ def main() -> None:
                     args.backbone_mode,
                     1.0 / args.control_hz,
                 )
+                trial_ledger = (
+                    ExecutedActionLedger()
+                    if args.action_ledger_path is not None
+                    else None
+                )
                 if args.mode == "async":
                     success, steps, metrics = _async_rollout(
                         env,
@@ -594,6 +649,7 @@ def main() -> None:
                         payload["normalization"],
                         horizon,
                         args,
+                        action_ledger=trial_ledger,
                     )
                 else:
                     success, steps, metrics = _blocking_rollout(
@@ -606,8 +662,21 @@ def main() -> None:
                         execute_steps,
                         args.ensemble_lambda,
                         1.0 / args.control_hz,
+                        action_ledger=trial_ledger,
                     )
                 wins += int(success)
+                if trial_ledger is not None:
+                    # Note: Settling steps (_settle) are explicitly excluded from the ledger export.
+                    # Only evaluation actions passed to env.step during rollout are recorded.
+                    trial_export = {
+                        "task_id": task_id,
+                        "trial": trial,
+                        "seed": seed,
+                        "control_interval": 1.0 / float(args.control_hz),
+                        "settling_excluded": True,
+                        "actions": trial_ledger.export(),
+                    }
+                    all_exported_ledger_records.append(trial_export)
                 record = {
                     "suite": args.suite,
                     "task_id": task_id,
@@ -649,6 +718,18 @@ def main() -> None:
     )
     temporary.replace(args.output)
     print(f"saved={args.output}", flush=True)
+
+    if args.action_ledger_path is not None:
+        args.action_ledger_path.parent.mkdir(parents=True, exist_ok=True)
+        temp_ledger = args.action_ledger_path.with_name(
+            f".{args.action_ledger_path.name}.tmp"
+        )
+        temp_ledger.write_text(
+            json.dumps(all_exported_ledger_records, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        temp_ledger.replace(args.action_ledger_path)
+        print(f"saved_action_ledger={args.action_ledger_path}", flush=True)
 
 
 if __name__ == "__main__":
