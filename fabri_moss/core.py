@@ -26,10 +26,13 @@ class MossConfig:
     rope_base: float = 1e6
     memory_mode: str = "consume"
     train_vision: bool = False
+    temporal_coordinate: str = "frame_index"
 
     def validate(self, num_native_layers: int) -> None:
         if self.memory_mode not in ("consume", "delta"):
             raise ValueError(f"memory_mode must be 'consume' or 'delta', got {self.memory_mode!r}")
+        if self.temporal_coordinate != "frame_index":
+            raise ValueError("temporal_coordinate must be 'frame_index'")
         if self.num_readout_tokens <= 0:
             raise ValueError(f"num_readout_tokens must be > 0, got {self.num_readout_tokens}")
         if self.max_frames is not None and self.max_frames <= 0:
@@ -482,7 +485,10 @@ class MossInternVL(nn.Module):
         col_indices = torch.arange(grid_side, device=device).repeat(grid_side)
         # Use the same physical-time coordinate as the reader/cross mask.
         # Falling back to frame_id preserves callers that do not provide time.
-        frame_time = float(observation_time) if observation_time is not None else float(frame_id)
+        # Use frame order as the internal temporal coordinate.  Dataset video
+        # timestamps (30 Hz) and online MuJoCo steps (80 Hz) have different
+        # physical scales; frame_id keeps K/V RoPE consistent across them.
+        frame_time = float(frame_id)
         time_indices = torch.full((P,), frame_time, dtype=torch.float32, device=device)
 
         native_features = features
@@ -491,7 +497,9 @@ class MossInternVL(nn.Module):
         # the independent visual memory only.  The language prompt is untouched,
         # so a zero cross gate remains exactly the native FabriVLA path.
         if observation_time is not None or metadata is not None:
-            metadata_text = metadata or f"Frame {frame_id}, time {float(observation_time):.6f} s."
+            # Keep the textual marker on the same discrete coordinate used by
+            # RoPE; physical seconds are recorded separately in the sample.
+            metadata_text = metadata or f"Frame {frame_id}."
             tokenizer = getattr(self.policy.embedder, "tokenizer", None)
             if tokenizer is None:
                 raise AttributeError("policy.embedder.tokenizer is required for frame metadata")
@@ -618,6 +626,22 @@ class MossInternVL(nn.Module):
             # Preserve the exact native multimodal sequence and padding mask.
             # Synthetic readout tokens would break gate=0 FabriVLA parity.
             attention_mask_2d = native_attention_mask.to(device=device)
+            # Historical cross-attention is for text/query positions. Keep
+            # the current image patch tokens on the native FabriVLA path.
+            native_visual_query_mask = None
+            try:
+                fused_prompt = self.policy.embedder._build_multimodal_prompt([1], clean_prompt)
+                if hasattr(self.policy.embedder, "_get_tokenized_prompt"):
+                    ids, _ = self.policy.embedder._get_tokenized_prompt(fused_prompt, [1])
+                    ids = ids.unsqueeze(0).to(device)
+                else:
+                    ids = self.policy.embedder.tokenizer(fused_prompt, return_tensors="pt").input_ids.to(device)
+                image_token_id = getattr(self.policy.embedder, "img_context_token_id", None)
+                if image_token_id is not None and tuple(ids.shape[1:]) == (hidden_states.shape[1],):
+                    native_visual_query_mask = ids.eq(int(image_token_id))
+            except Exception:
+                # Some lightweight test embedders do not expose token ids.
+                native_visual_query_mask = None
         else:
             tokenizer = self.policy.embedder.tokenizer
             tokens = tokenizer(prompt_text, return_tensors="pt")
@@ -630,6 +654,7 @@ class MossInternVL(nn.Module):
             hidden_states = core.embed_tokens(input_ids)
             readout_embeds = self.readout_embeddings.unsqueeze(0).to(dtype=base_dtype, device=device)
             hidden_states = torch.cat([hidden_states, readout_embeds], dim=1)
+            native_visual_query_mask = None
             attention_mask_2d = torch.ones(
                 (hidden_states.shape[0], hidden_states.shape[1]), dtype=torch.bool, device=device
             )
@@ -672,23 +697,40 @@ class MossInternVL(nn.Module):
                 )
 
         if observation_times is None:
-            effective_observation_times = [float(fid) for fid in effective_frame_ids]
+            provided_observation_times = [float(fid) for fid in effective_frame_ids]
         else:
             if len(observation_times) != len(frames):
                 raise ValueError(
                     f"observation_times length {len(observation_times)} must match frames length {len(frames)}"
                 )
-            effective_observation_times = [float(t) for t in observation_times]
-            if not all(math.isfinite(t) for t in effective_observation_times):
+            provided_observation_times = [float(t) for t in observation_times]
+            if not all(math.isfinite(t) for t in provided_observation_times):
                 raise ValueError("observation_times must contain finite values")
             if any(
-                effective_observation_times[i] <= effective_observation_times[i - 1]
-                for i in range(1, len(effective_observation_times))
+                provided_observation_times[i] <= provided_observation_times[i - 1]
+                for i in range(1, len(provided_observation_times))
             ):
                 raise ValueError(
                     "observation_times must be strictly increasing to preserve causal ordering"
                 )
 
+        # All internal temporal operations use the discrete frame coordinate;
+        # the provided physical timestamps are validated above for provenance.
+        effective_observation_times = [float(fid) for fid in effective_frame_ids]
+
+        # The newest frame is already present in the native query sequence.
+        # Only older frames are auxiliary memory on that path; this avoids
+        # counting the current image twice when the gate opens.
+        memory_frames = (
+            frames
+            if memory_matrices is not None
+            else (frames[:-1] if native_path else frames)
+        )
+        memory_times = (
+            effective_observation_times
+            if memory_matrices is not None
+            else (effective_observation_times[:-1] if native_path else effective_observation_times)
+        )
         first_block = next(iter(self.cross_blocks.values()))
         expected_head_dim = first_block.head_dim
         curr_observation_time = effective_observation_times[-1]
@@ -707,18 +749,21 @@ class MossInternVL(nn.Module):
 
         mem_keys: Dict[int, torch.Tensor] = {}
         mem_values: Dict[int, torch.Tensor] = {}
-        cross_mask = build_causal_cross_mask(
-            effective_observation_times,
-            [f.num_tokens for f in frames],
-            [curr_observation_time] * total_seq_len,
-            device=device,
-            dtype=torch.float32,
-        )
+        cross_mask = None
+        if memory_frames:
+            cross_mask = build_causal_cross_mask(
+                memory_times,
+                [f.num_tokens for f in memory_frames],
+                [curr_observation_time] * total_seq_len,
+                device=device,
+                dtype=torch.float32,
+            )
         for l_idx, layer_num in enumerate(self.config.cross_layers):
-            layer_k_list = [f.keys[l_idx].to(device=device) for f in frames]
-            layer_v_list = [f.values[l_idx].to(device=device) for f in frames]
-            mem_keys[layer_num] = torch.cat(layer_k_list, dim=2)
-            mem_values[layer_num] = torch.cat(layer_v_list, dim=2)
+            if memory_frames:
+                layer_k_list = [f.keys[l_idx].to(device=device) for f in memory_frames]
+                layer_v_list = [f.values[l_idx].to(device=device) for f in memory_frames]
+                mem_keys[layer_num] = torch.cat(layer_k_list, dim=2)
+                mem_values[layer_num] = torch.cat(layer_v_list, dim=2)
 
         shallow_states = None
         shallow_target = self.config.shallow_layer
@@ -738,10 +783,10 @@ class MossInternVL(nn.Module):
             )
             hidden_states = layer_outputs[0] if isinstance(layer_outputs, tuple) else layer_outputs
 
-            if current_layer_1based in self.config.cross_layers:
+            if current_layer_1based in self.config.cross_layers and memory_frames:
                 block = self.cross_blocks[str(current_layer_1based)]
                 mat = memory_matrices.get(current_layer_1based) if memory_matrices is not None else None
-                hidden_states = block(
+                cross_hidden_states = block(
                     hidden_states=hidden_states,
                     key_states=mem_keys[current_layer_1based],
                     value_states=mem_values[current_layer_1based],
@@ -750,6 +795,11 @@ class MossInternVL(nn.Module):
                     cross_attention_mask=cross_mask,
                     memory_matrix=mat,
                 )
+                if native_visual_query_mask is not None:
+                    text_mask = (~native_visual_query_mask).unsqueeze(-1)
+                    hidden_states = torch.where(text_mask, cross_hidden_states, hidden_states)
+                else:
+                    hidden_states = cross_hidden_states
 
             if current_layer_1based == shallow_target:
                 shallow_states = (

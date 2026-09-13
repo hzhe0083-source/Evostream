@@ -248,7 +248,12 @@ def main():
             if epoch==start_epoch and bi<batch_cursor: continue
             optimizer.zero_grad(set_to_none=True); sums=torch.zeros(4,dtype=torch.float64,device=device)
             for sample in samples:
-                total,gt,kd,c=_sample_loss(model,teacher_head,sample,device,args.kd_weight,teacher_policy=teacher_policy); total.backward(); sums+=torch.tensor([total.detach().item(),gt.detach().item(),kd.detach().item(),c],dtype=torch.float64,device=device)
+                total,gt,kd,c=_sample_loss(model,teacher_head,sample,device,args.kd_weight,teacher_policy=teacher_policy)
+                # A one-frame prefix has no historical memory after the
+                # native-path split, so its loss is a constant parity check.
+                if total.requires_grad:
+                    total.backward()
+                sums+=torch.tensor([total.detach().item(),gt.detach().item(),kd.detach().item(),c],dtype=torch.float64,device=device)
             if world>1: dist.all_reduce(sums,op=dist.ReduceOp.SUM)
             count=int(sums[3].item()); _allreduce_mixed_precision_gradients(trainable,count); grad_norm=clip_parameter_groups_norm(trainable,args.grad_clip_norm); optimizer.step(); step+=1; epoch_targets_seen+=count; batch_cursor=bi+1
             if rank==0:

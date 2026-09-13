@@ -979,9 +979,14 @@ def main() -> None:
         )
         provenance["base_metadata"] = meta
 
-        if (args.mode == "moss" and args.memory_mode == "delta") or args.mode == "native-cache":
+        # GPU comparisons are only meaningful under the same native FA2 path
+        # used by the checkpoint/training contract.  Keep CPU functional tests
+        # permissive, but fail fast instead of silently producing an eager
+        # attention result that cannot be compared with the reference baseline.
+        if str(args.device).startswith("cuda"):
             fa2_diag = assert_native_fa2(policy)
             provenance["native_fa2_diagnostics"] = fa2_diag
+            print(f"[evaluate_async] Native FA2 verified: {fa2_diag}", flush=True)
 
         if hasattr(policy, "action_head") and hasattr(policy.action_head, "config"):
             policy.action_head.config.num_inference_timesteps = args.num_inference_timesteps
