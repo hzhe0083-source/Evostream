@@ -796,7 +796,9 @@ class MossInternVL(nn.Module):
                     memory_matrix=mat,
                 )
                 if native_visual_query_mask is not None:
-                    text_mask = (~native_visual_query_mask).unsqueeze(-1)
+                    text_mask = (
+                        ~native_visual_query_mask & attention_mask_2d.bool()
+                    ).unsqueeze(-1)
                     hidden_states = torch.where(text_mask, cross_hidden_states, hidden_states)
                 else:
                     hidden_states = cross_hidden_states
