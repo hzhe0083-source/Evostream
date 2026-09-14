@@ -1,0 +1,2 @@
+[2026-09-14 21:27:42,394] [INFO] [real_accelerator.py:239:get_accelerator] Setting ds_accelerator to cuda (auto detect)
+Truncating LLM layers from 28 to 14
