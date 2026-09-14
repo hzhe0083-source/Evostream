@@ -10,6 +10,7 @@ ROOT="$1"
 shift
 [[ -n "$ROOT" ]] || { echo 'OUTPUT_ROOT cannot be empty.' >&2; exit 1; }
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 LAUNCHER="$SCRIPT_DIR/run_moss_cross_recovery.sh"
 PYTHON="${PYTHON:-/root/fabrivla_env/bin/python}"
 BRIDGE_DIR="$ROOT/bridge"
