@@ -231,6 +231,7 @@ class MossCrossAttentionBlock(nn.Module):
         sin_q: torch.Tensor,
         cross_attention_mask: Optional[torch.Tensor] = None,
         memory_matrix: Optional[torch.Tensor] = None,
+        residual_scale: float = 1.0,
     ) -> torch.Tensor:
         orig_dtype = hidden_states.dtype
         residual = hidden_states
@@ -256,12 +257,12 @@ class MossCrossAttentionBlock(nn.Module):
         attn_out = attn_out.transpose(1, 2).contiguous().view(B, S, -1)
         attn_out = self.o_proj(attn_out)
 
-        hidden_states = residual + (self.attn_gate.tanh() * attn_out).to(orig_dtype)
+        hidden_states = residual + (self.attn_gate.tanh() * float(residual_scale) * attn_out).to(orig_dtype)
 
         residual = hidden_states
         normed_mlp = self.post_attention_layernorm(hidden_states.float())
         mlp_out = self.mlp(normed_mlp)
-        hidden_states = residual + (self.mlp_gate.tanh() * mlp_out).to(orig_dtype)
+        hidden_states = residual + (self.mlp_gate.tanh() * float(residual_scale) * mlp_out).to(orig_dtype)
         return hidden_states
 
 
@@ -270,6 +271,7 @@ class MossInternVL(nn.Module):
         super().__init__()
         self.policy = policy
         self.config = config or MossConfig()
+        self.history_scale = 1.0
         self.training_stage = "bridge"
         self._revision = 0
 
@@ -1043,6 +1045,7 @@ class MossInternVL(nn.Module):
                     sin_q=sin_q,
                     cross_attention_mask=cross_mask,
                     memory_matrix=mat,
+                    residual_scale=self.history_scale,
                 )
                 if native_visual_query_mask is not None:
                     text_mask = (
@@ -1249,6 +1252,7 @@ class MossInternVL(nn.Module):
                     cos_q=position_embeddings[0],
                     sin_q=position_embeddings[1],
                     cross_attention_mask=cross_masks[layer_num],
+                    residual_scale=self.history_scale,
                 )
                 apply_cross = valid_query_mask & has_visible_memory.unsqueeze(1)
                 h = torch.where(apply_cross.unsqueeze(-1), cross_h, h)

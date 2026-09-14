@@ -164,9 +164,11 @@ def _load_adapter_model(
         raise ValueError(
             f"MOSS adapter memory_mode {config.memory_mode!r} != requested {memory_mode!r}"
         )
-    if window is not None and config.max_frames != window:
+    if window is not None and (
+        config.max_frames is not None and window > config.max_frames
+    ):
         raise ValueError(
-            f"MOSS adapter max_frames {config.max_frames!r} != requested window {window!r}"
+            f"requested window {window!r} exceeds adapter max_frames {config.max_frames!r}"
         )
 
     model = MossInternVL(policy, config=config)
@@ -612,6 +614,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--adapter-stage", choices=("bridge", "expert", "joint"), default="bridge")
     parser.add_argument("--memory-mode", choices=("consume",), default="consume")
     parser.add_argument("--window", type=int, default=None)
+    parser.add_argument("--history-scale", type=float, default=1.0)
     parser.add_argument("--fabri-root", default="/root/FabriVLA")
     parser.add_argument("--vlm-path", "--vlm", dest="vlm_path", default="/root/models/InternVL3_5-1B")
     parser.add_argument("--device", default="cuda:0")
@@ -641,6 +644,8 @@ def parse_args(raw_args: Optional[Sequence[str]] = None) -> argparse.Namespace:
             raise ValueError(f"--{name.replace('_', '-')} must be positive")
     if args.window is not None and args.window <= 0:
         raise ValueError("--window must be positive")
+    if not math.isfinite(args.history_scale) or args.history_scale < 0:
+        raise ValueError("--history-scale must be finite and non-negative")
     if args.step_seconds is not None and (not math.isfinite(args.step_seconds) or args.step_seconds <= 0):
         raise ValueError("--step-seconds must be positive and finite")
     return args
@@ -776,6 +781,7 @@ def run_evaluation(
         )
         if hasattr(model, "eval"):
             model.eval()
+        model.history_scale = float(args.history_scale)
         provenance.update(model_provenance)
         native_meta = provenance.get("native_fa2")
         if target_device.type == "cuda" and not (isinstance(native_meta, dict) and native_meta.get("native_fa2_enabled", False)):
