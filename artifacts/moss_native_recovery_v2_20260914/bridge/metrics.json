@@ -1,0 +1,14 @@
+{
+  "step": 663,
+  "epoch": 1,
+  "batch_cursor": 0,
+  "world_size": 2,
+  "fa2": {
+    "language_attn_implementation": "flash_attention_2",
+    "language_layers_count": 14,
+    "vision_layers_count": 24,
+    "vision_flash_attn": true,
+    "native_fa2_enabled": true
+  },
+  "architecture_revision": "moss-cross-qkvo-lora-fp32-r8-a16-d0.1-v1"
+}

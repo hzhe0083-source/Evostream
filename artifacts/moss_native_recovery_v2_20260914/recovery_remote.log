@@ -1,0 +1,28 @@
+[2026-09-14 15:35:38,264] [INFO] [real_accelerator.py:239:get_accelerator] Setting ds_accelerator to cuda (auto detect)
+[2026-09-14 15:35:38,268] [INFO] [real_accelerator.py:239:get_accelerator] Setting ds_accelerator to cuda (auto detect)
+Truncating LLM layers from 28 to 14
+Truncating LLM layers from 28 to 14
+[2026-09-14 15:36:04,559] [INFO] [real_accelerator.py:239:get_accelerator] Setting ds_accelerator to cuda (auto detect)
+Truncating LLM layers from 28 to 14
+Truncating LLM layers from 28 to 14
+Truncating LLM layers from 28 to 14
+{
+  "original": {
+    "n": 24,
+    "mean_command_mae": 0.027818197680365604
+  },
+  "window1": {
+    "n": 24,
+    "mean_command_mae": 0.027818197680365604
+  },
+  "window16": {
+    "n": 24,
+    "mean_command_mae": 0.029778044253665332
+  }
+}
+replay gate warning: window16 MAE 0.02977804 > window1 0.02781820; continuing Joint after native parity
+replay native gate passed: original=0.02781820 window1=0.02781820
+[2026-09-14 15:38:53,773] [INFO] [real_accelerator.py:239:get_accelerator] Setting ds_accelerator to cuda (auto detect)
+Truncating LLM layers from 28 to 14
+[2026-09-14 15:38:57,320] [INFO] [real_accelerator.py:239:get_accelerator] Setting ds_accelerator to cuda (auto detect)
+Truncating LLM layers from 28 to 14
