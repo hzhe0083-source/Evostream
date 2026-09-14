@@ -1,0 +1,2 @@
+nohup: ignoring input
+PASS output=/root/libero_spatial_ora0_v1/libero_spatial_h8p2_t4_v1.pt samples=8000 demos=500 actions=(8000, 4, 8, 7) proprio=(8000, 4, 9)

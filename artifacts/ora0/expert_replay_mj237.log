@@ -1,0 +1,17 @@
+[robosuite WARNING] No private macro file found! (__init__.py:7)
+[robosuite WARNING] It is recommended to use a private macro file (__init__.py:8)
+[robosuite WARNING] To setup, run: python /root/libero_spatial_ora0_v1/env310/lib/python3.10/site-packages/robosuite/scripts/setup_macros.py (__init__.py:9)
+Gym has been unmaintained since 2022 and does not support NumPy 2.0 amongst other critical functionality.
+Please upgrade to Gymnasium, the maintained drop-in replacement of Gym, or contact the authors of your software and request that they upgrade.
+See the migration guide at https://gymnasium.farama.org/introduction/migration_guide/ for additional information.
+task=0 success=1 max_state_err=2.00392 steps=98 pick up the black bowl between the plate and the ramekin and place it on the plate
+task=1 success=1 max_state_err=0.63465 steps=103 pick up the black bowl from table center and place it on the plate
+task=2 success=1 max_state_err=3.70615 steps=153 pick up the black bowl in the top drawer of the wooden cabinet and place it on the plate
+task=3 success=1 max_state_err=2.78175 steps=123 pick up the black bowl next to the cookie box and place it on the plate
+task=4 success=1 max_state_err=4.08167 steps=115 pick up the black bowl next to the plate and place it on the plate
+task=5 success=1 max_state_err=12.1519 steps=152 pick up the black bowl next to the ramekin and place it on the plate
+task=6 success=1 max_state_err=3.08706 steps=99 pick up the black bowl on the cookie box and place it on the plate
+task=7 success=0 max_state_err=6.12249 steps=137 pick up the black bowl on the ramekin and place it on the plate
+task=8 success=1 max_state_err=4.42077 steps=155 pick up the black bowl on the stove and place it on the plate
+task=9 success=1 max_state_err=1.72045 steps=136 pick up the black bowl on the wooden cabinet and place it on the plate
+REPLAY_GATE_SUCCESS 9/10

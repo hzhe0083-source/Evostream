@@ -1,0 +1,5 @@
+assets: /root/libero_official_ora0/libero/libero/./assets
+bddl_files: /root/libero_official_ora0/libero/libero/./bddl_files
+benchmark_root: /root/libero_official_ora0/libero/libero
+datasets: /root/libero_spatial_ora0_v1/datasets
+init_states: /root/libero_official_ora0/libero/libero/./init_files

@@ -1,0 +1,12 @@
+nohup: ignoring input
+DINO-main data: LongTrajFramesDataset（8000 样本，帧从 longtraj JPEG 在线解码，decode_cache_tasks=10）
+--task-sampling full: 任务权重 [1.0]（active_tasks=10, samples=8000；每 epoch 每行无放回恰好一次）
+DINO-main data: LongTrajFramesDataset（8000 样本，帧从 longtraj JPEG 在线解码，decode_cache_tasks=10）
+--task-sampling full: 任务权重 [1.0]（active_tasks=10, samples=8000；每 epoch 每行无放回恰好一次）
+dino-main: frozen dinov2_vitl14_reg4 REPLACES V-JEPA as the VA main vision (224px, dim=1024, 256 tokens/decision, params=303,230,976)
+dino-main: frozen dinov2_vitl14_reg4 REPLACES V-JEPA as the VA main vision (224px, dim=1024, 256 tokens/decision, params=303,230,976)
+data_parallel contract=manual_post_backward_grad_allreduce_v1 world_size=2 global_batch=32 local_batch=16
+  [longtraj] 解码 libero_spatial_t07: 7111 帧, 0s
+  [longtraj] 解码 libero_spatial_t07: 7111 帧, 0s
+step=1 mode=bidir_va contract=single task=task-7 action_valid=1.0000 recovery_rows=0.0000 sequence=4 loss=1.815575 flow=1.815575 flow_first2=1.742841 flow_tail6=1.839820 pair=0.000000 future=0.000000 world_objective=0.000000 world=0.000000 goal_delta=0.000000/0.000000 grad=20.849438 resources[rss=2510.2MiB fd=56 cuda=2560.3/5530.0MiB]
+step=2 mode=bidir_va contract=single task=task-7 action_valid=1.0000 recovery_rows=0.0000 sequence=4 loss=2.021132 flow=2.021132 flow_first2=2.041965 flow_tail6=2.014187 pair=0.000000 future=0.000000 world_objective=0.000000 world=0.000000 goal_delta=0.000000/0.000000 grad=30.373642 resources[rss=2530.9MiB fd=56 cuda=2560.3/6204.0MiB]
