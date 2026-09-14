@@ -262,6 +262,11 @@ def configure_trainable_parameters(
                 parameter.requires_grad_(False)
     else:
         raise ValueError(f"unknown stage {stage!r}")
+    head = getattr(model.policy, "action_head", None)
+    if head is not None:
+        # Freezing weights does not disable dropout.  Keep the frozen expert
+        # deterministic while autograd still differentiates its inputs.
+        head.train(model.training and any(p.requires_grad for p in head.parameters()))
     trainable = [p for p in model.parameters() if p.requires_grad]
     if stage == "joint" and any(p.dtype != torch.float32 for p in trainable):
         bad = [str(p.dtype) for p in trainable if p.dtype != torch.float32][:3]
@@ -381,7 +386,12 @@ def _sample_loss(
                     fixed_noise = fixed_noise[i : i + 1]
             if fixed_noise is None:
                 fixed_noise = torch.rand_like(action) * 2.0 - 1.0
-            fixed_t = sample.get("fixed_t", 0.5)
+            fixed_t = sample.get("fixed_t")
+            if fixed_t is None:
+                concentration = action.new_tensor(2.0)
+                fixed_t = torch.distributions.Beta(concentration, concentration).sample(
+                    (action.shape[0],)
+                ).clamp(0.02, 0.98)
             fixed_t = torch.as_tensor(fixed_t, dtype=action.dtype).reshape(-1)
             if fixed_t.numel() == masks.shape[0]:
                 fixed_t = fixed_t[i : i + 1]

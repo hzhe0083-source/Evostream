@@ -325,8 +325,9 @@ class MossInternVL(nn.Module):
         if mode:
             self._revision += 1
         self.policy.eval()
-        if mode and self.training_stage in ("expert", "joint") and hasattr(self.policy, "action_head"):
-            self.policy.action_head.train()
+        head = getattr(self.policy, "action_head", None)
+        if head is not None:
+            head.train(mode and any(p.requires_grad for p in head.parameters()))
         return self
 
     def set_training_stage(self, stage: str, *, train_vision: Optional[bool] = None):
