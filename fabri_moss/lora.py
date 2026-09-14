@@ -12,8 +12,8 @@ from torch import Tensor, nn
 from torch.nn import functional as F
 
 
-_LORA_CONTEXT: ContextVar[Tuple[bool, Tensor | None]] = ContextVar(
-    "fabri_moss_lora_context", default=(True, None)
+_LORA_CONTEXT: ContextVar[Tuple[bool, Tensor | None, Tensor | None]] = ContextVar(
+    "fabri_moss_lora_context", default=(True, None, None)
 )
 
 
@@ -83,7 +83,7 @@ class FP32LoRALinear(nn.Module):
         if base_weight is not None and base_input.dtype != base_weight.dtype:
             base_input = base_input.to(dtype=base_weight.dtype)
         base_out = self.base(base_input, *args, **kwargs)
-        lora_enabled, sample_mask = _LORA_CONTEXT.get()
+        lora_enabled, sample_mask, token_mask = _LORA_CONTEXT.get()
         if not lora_enabled:
             return base_out
         residual = F.linear(self.dropout(input.float()), self.lora_A)
@@ -96,6 +96,13 @@ class FP32LoRALinear(nn.Module):
                     f"input={tuple(input.shape)}, mask={tuple(sample_mask.shape)}"
                 )
             residual = residual * sample_mask.view(-1, *([1] * (residual.ndim - 1)))
+        if token_mask is not None:
+            if input.ndim != 3 or tuple(token_mask.shape) != tuple(input.shape[:2]):
+                raise ValueError(
+                    "LoRA token mask must match [batch, sequence] input dimensions: "
+                    f"input={tuple(input.shape)}, mask={tuple(token_mask.shape)}"
+                )
+            residual = residual * token_mask.to(device=residual.device, dtype=residual.dtype).unsqueeze(-1)
         return base_out + residual.to(dtype=base_out.dtype, device=base_out.device)
 
     def _apply(self, fn):
@@ -217,6 +224,7 @@ def lora_context(
     *,
     enabled: bool = True,
     sample_mask: Tensor | None = None,
+    token_mask: Tensor | None = None,
 ):
     """Temporarily enable LoRA, optionally per batch sample.
 
@@ -228,7 +236,11 @@ def lora_context(
         if sample_mask.ndim != 1 or sample_mask.dtype != torch.bool:
             raise ValueError("sample_mask must be a one-dimensional bool tensor")
         sample_mask = sample_mask.detach()
-    token = _LORA_CONTEXT.set((bool(enabled), sample_mask))
+    if token_mask is not None:
+        if token_mask.ndim != 2 or token_mask.dtype != torch.bool:
+            raise ValueError("token_mask must be a two-dimensional bool tensor")
+        token_mask = token_mask.detach()
+    token = _LORA_CONTEXT.set((bool(enabled), sample_mask, token_mask))
     try:
         yield
     finally:

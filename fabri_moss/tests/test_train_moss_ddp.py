@@ -168,6 +168,22 @@ def test_lora_context_bypasses_current_only_sample_and_keeps_history_sample_acti
     assert not torch.equal(output[1], native[1])
 
 
+def test_lora_context_masks_visual_and_padding_tokens():
+    from fabri_moss.lora import FP32LoRALinear, lora_context
+
+    base = torch.nn.Linear(4, 4, bias=False)
+    module = FP32LoRALinear(base, rank=1, alpha=1.0, dropout=0.0)
+    with torch.no_grad():
+        module.lora_A.fill_(1.0)
+        module.lora_B.fill_(1.0)
+    inputs = torch.ones(1, 3, 4)
+    native = base(inputs)
+    with lora_context(module, token_mask=torch.tensor([[True, False, True]])):
+        output = module(inputs)
+    assert torch.equal(output[:, 1], native[:, 1])
+    assert not torch.equal(output[:, 0], native[:, 0])
+
+
 def test_joint_checkpoint_roundtrip_restores_lora_without_base_policy(tmp_path):
     from fabri_moss.core import MossConfig, MossInternVL
     from fabri_moss.tests.test_core import TinyFabriVLAPolicy

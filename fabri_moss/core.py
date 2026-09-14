@@ -366,12 +366,18 @@ class MossInternVL(nn.Module):
         *,
         lora_enabled: bool = True,
         lora_mask=None,
+        lora_token_mask=None,
         **kwargs,
     ):
         # LoRA is an optional Joint-stage adapter.  Keep it off for the native
         # current-only path; in a mixed batch apply it only to samples that
         # actually have historical FrameKV.
-        with lora_context(self.policy, enabled=lora_enabled, sample_mask=lora_mask):
+        with lora_context(
+            self.policy,
+            enabled=lora_enabled,
+            sample_mask=lora_mask,
+            token_mask=lora_token_mask,
+        ):
             return native_layer(hidden_states, **kwargs)
 
     @staticmethod
@@ -1011,6 +1017,10 @@ class MossInternVL(nn.Module):
                 native_layer,
                 hidden_states,
                 lora_enabled=bool(memory_matrices is not None or memory_frames),
+                lora_token_mask=(
+                    attention_mask_2d.bool() & ~native_visual_query_mask
+                    if native_visual_query_mask is not None else None
+                ),
                 attention_mask=causal_mask,
                 position_ids=position_ids,
                 past_key_value=None,
@@ -1222,6 +1232,7 @@ class MossInternVL(nn.Module):
                 native_layer,
                 h,
                 lora_mask=has_visible_memory,
+                lora_token_mask=valid_query_mask,
                 attention_mask=native_mask_after_cross if cross_seen else native_mask,
                 position_ids=position_ids,
                 past_key_value=None, output_attentions=False, use_cache=False,
