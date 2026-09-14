@@ -1545,8 +1545,10 @@ class VisionSession:
 class FrameKVSession(VisionSession):
     """Unbounded episode-scoped projected-frame session for consume planning."""
 
-    def __init__(self, model: MossInternVL):
-        super().__init__(model, max_frames=None)
+    def __init__(self, model: MossInternVL, max_frames: Optional[int] = None):
+        # ``None`` preserves the streaming episode contract; evaluation can
+        # request the training window explicitly to avoid distribution drift.
+        super().__init__(model, max_frames=max_frames)
 
     def reset(self, episode_id: str, prompt: str) -> None:
         # The async vision worker may be using the model tokenizer while a new

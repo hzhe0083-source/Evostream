@@ -51,6 +51,7 @@ from fabri_moss.evaluate_async import (
     denormalize_action,
 )
 from fabri_moss.runtime import assert_native_fa2, load_native_checkpoint
+from fabri_moss.native_training import _autocast_context
 
 
 def _cross_lora_paths(model: MossInternVL) -> List[str]:
@@ -303,6 +304,7 @@ def run_episode(
     state_dim: int = 24,
     action_dim: int = 24,
     flow_steps: int = OFFICIAL_FLOW_STEPS,
+    history_window: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Run one synchronous consume-session episode with an auditable ledger."""
     if episode_horizon <= 0 or exec_horizon <= 0 or observation_stride <= 0 or flow_steps <= 0:
@@ -313,6 +315,10 @@ def run_episode(
         raise ValueError("per-plan seeding requires task_slug and episode_index")
     if getattr(model.config, "memory_mode", "consume") != "consume":
         raise ValueError("run_episode requires MossConfig(memory_mode='consume')")
+    if history_window is not None and (
+        isinstance(history_window, bool) or not isinstance(history_window, int) or history_window <= 0
+    ):
+        raise ValueError("history_window must be a positive integer or None")
 
     dt = _env_dt(env, step_seconds)
     time_source = _env_time_source(env, step_seconds)
@@ -339,7 +345,13 @@ def run_episode(
     if hasattr(head_cfg, "num_inference_timesteps"):
         head_cfg.num_inference_timesteps = flow_steps
 
-    session = FrameKVSession(model)
+    # Match the training contract by default.  An unbounded episode cache
+    # would expose hundreds of frames although Joint was trained with
+    # max_frames=16, invalidating the closed-loop result.
+    effective_history_window = (
+        history_window if history_window is not None else getattr(model.config, "max_frames", None)
+    )
+    session = FrameKVSession(model, max_frames=effective_history_window)
     session.reset(episode_id=episode_id, prompt=prompt)
     current_plan: Optional[np.ndarray] = None
     source_step = -1
@@ -387,7 +399,7 @@ def run_episode(
                 if seed_policy == "per-plan":
                     plan_seed = derive_plan_seed(master_seed, task_slug, episode_index, source_step)
                 started = time.monotonic()
-                with torch.no_grad(), fixed_diffusion_seed(plan_seed, device):
+                with torch.no_grad(), fixed_diffusion_seed(plan_seed, device), _autocast_context(device, enabled=False):
                     deep, shallow = session.query()
                     prediction = model.policy.action_head.sample(
                         deep,
@@ -809,6 +821,10 @@ def run_evaluation(
                     seed=args.seed + ep_idx,
                     seed_policy=args.seed_policy,
                     flow_steps=args.num_inference_timesteps,
+                    history_window=(
+                        args.window if args.window is not None
+                        else getattr(model.config, "max_frames", None)
+                    ),
                     step_seconds=args.step_seconds,
                     state_dim=int(getattr(ah_cfg, "state_dim", 24)),
                     action_dim=int(getattr(ah_cfg, "per_action_dim", 24)),
