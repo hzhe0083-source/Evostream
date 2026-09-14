@@ -95,6 +95,14 @@ def parser():
     p.add_argument("--lora-alpha", type=float, default=LORA_ALPHA)
     p.add_argument("--lora-dropout", type=float, default=LORA_DROPOUT)
     p.add_argument("--kd-weight", type=float, default=1.0)
+    p.add_argument(
+        "--native-kd-weight", type=float, default=0.0,
+        help="current-frame-only velocity KD weight (set >0 for recovery diagnostics)",
+    )
+    p.add_argument(
+        "--joint-train-action-expert", action="store_true",
+        help="unfreeze Action Expert in joint; default keeps the native expert frozen",
+    )
     p.add_argument("--grad-clip-norm", type=float, default=1.0)
     p.add_argument("--max-episodes", type=int)
     p.add_argument("--seed", type=int, default=4042)
@@ -131,7 +139,7 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--num-workers must be non-negative and --save-every positive")
     if args.max_updates is not None and args.max_updates <= 0:
         raise ValueError("--max-updates must be positive")
-    for name in ("lr", "action_lr", "base_lr", "kd_weight", "grad_clip_norm"):
+    for name in ("lr", "action_lr", "base_lr", "kd_weight", "native_kd_weight", "grad_clip_norm"):
         value = float(getattr(args, name))
         if not np.isfinite(value) or value < 0 or (name in ("lr", "action_lr", "base_lr", "grad_clip_norm") and value == 0):
             raise ValueError(f"--{name.replace('_', '-')} must be finite and positive")
@@ -220,12 +228,16 @@ def configure_lora(model: MossInternVL, args: argparse.Namespace) -> Dict[str, F
     return modules
 
 
-def configure_trainable_parameters(model: MossInternVL, stage: str) -> List[torch.nn.Parameter]:
+def configure_trainable_parameters(
+    model: MossInternVL, stage: str, train_action_expert: Optional[bool] = None
+) -> List[torch.nn.Parameter]:
     """Set the exact trainable surface for each stage.
 
     Joint deliberately excludes bridge/readout and every native base tensor;
     only Action Expert parameters and injected LoRA tensors remain trainable.
     """
+    if train_action_expert is not None:
+        model.joint_train_action_expert = bool(train_action_expert)
     for parameter in model.parameters():
         parameter.requires_grad_(False)
     if stage == "bridge":
@@ -239,8 +251,10 @@ def configure_trainable_parameters(model: MossInternVL, stage: str) -> List[torc
     elif stage == "joint":
         if not lora_modules(model.policy):
             raise RuntimeError("joint stage requires injected q/k/v/o LoRA modules")
-        for parameter in model.action_parameters():
-            parameter.requires_grad_(True)
+        train_action_expert = bool(getattr(model, "joint_train_action_expert", True))
+        if train_action_expert:
+            for parameter in model.action_parameters():
+                parameter.requires_grad_(True)
         for module in lora_modules(model.policy).values():
             module.lora_A.requires_grad_(True)
             module.lora_B.requires_grad_(True)
@@ -287,7 +301,10 @@ def _target_tensors(s):
     return states, actions, masks, vis
 
 
-def _sample_loss(student, teacher_head, sample, device, kd_weight, teacher_policy=None):
+def _sample_loss(
+    student, teacher_head, sample, device, kd_weight, teacher_policy=None,
+    native_kd_weight: float = 0.0,
+):
     images = sample["images_window"]
     frame_ids = [int(x) for x in sample["frame_ids"]]
     prompt = str(sample["prompt"])
@@ -352,6 +369,24 @@ def _sample_loss(student, teacher_head, sample, device, kd_weight, teacher_polic
                 sample_time_weights.ndim == 2 and sample_time_weights.shape[0] == masks.shape[0]
             ):
                 sample_time_weights = sample_time_weights[i : i + 1]
+        # Recovery mode can explicitly distill the native current-frame path.
+        # Reuse one noise/t pair for history and current-only predictions so
+        # the auxiliary term measures representation drift, not sampling noise.
+        fixed_noise = fixed_t = None
+        if native_kd_weight > 0:
+            fixed_noise = sample.get("fixed_noise")
+            if fixed_noise is not None:
+                fixed_noise = torch.as_tensor(fixed_noise)
+                if fixed_noise.ndim >= 3 and fixed_noise.shape[0] == masks.shape[0]:
+                    fixed_noise = fixed_noise[i : i + 1]
+            if fixed_noise is None:
+                fixed_noise = torch.rand_like(action) * 2.0 - 1.0
+            fixed_t = sample.get("fixed_t", 0.5)
+            fixed_t = torch.as_tensor(fixed_t, dtype=action.dtype).reshape(-1)
+            if fixed_t.numel() == masks.shape[0]:
+                fixed_t = fixed_t[i : i + 1]
+            if fixed_t.numel() == 1:
+                fixed_t = fixed_t.expand(action.shape[0])
         loss_kwargs = dict(
             student_head=student.policy.action_head,
             teacher_head=teacher_head,
@@ -363,6 +398,8 @@ def _sample_loss(student, teacher_head, sample, device, kd_weight, teacher_polic
             actions=action,
             action_mask=mask,
             kd_weight=kd_weight,
+            fixed_noise=fixed_noise,
+            fixed_t=fixed_t,
         )
         if any(k in sample for k in ("action_time_weights", "time_weights", "valid_action_lengths", "execution_horizon")):
             loss_kwargs.update(
@@ -378,6 +415,17 @@ def _sample_loss(student, teacher_head, sample, device, kd_weight, teacher_polic
                 ),
             )
         loss, gt, kd, _, _ = compute_flow_kd_loss(**loss_kwargs)
+        if native_kd_weight > 0:
+            current_deep, current_shallow = student.read_memory(
+                frames[count - 1 : count], prompt,
+                frame_ids=frame_ids[count - 1 : count],
+                observation_times=(prefix_times[count - 1 : count] if prefix_times is not None else None),
+            )
+            native_kwargs = dict(loss_kwargs)
+            native_kwargs.update(student_deep=current_deep, student_shallow=current_shallow, kd_weight=1.0)
+            _, _, native_kd, _, _ = compute_flow_kd_loss(**native_kwargs)
+            loss = loss + float(native_kd_weight) * native_kd
+            kd = kd + float(native_kd_weight) * native_kd
         # Keep the global denominator aligned with compute_flow_kd_loss.  Old
         # hand-written samples without cadence metadata retain raw mask counts.
         c = float(mask.sum().item())
@@ -510,6 +558,7 @@ def _architecture(model: Any) -> Dict[str, Any]:
         "cross_layers": list(getattr(getattr(model, "config", None), "cross_layers", ())),
         "lora": modules,
         "trainable_surface": surface,
+        "joint_train_action_expert": bool(getattr(model, "joint_train_action_expert", True)),
     }
 
 
@@ -764,6 +813,8 @@ def _training_contract(args: argparse.Namespace, world: int, model: Any) -> Dict
         "lr": float(getattr(args, "lr", 0.0)),
         "action_lr": float(getattr(args, "action_lr", 0.0)),
         "kd_weight": float(getattr(args, "kd_weight", 0.0)),
+        "native_kd_weight": float(getattr(args, "native_kd_weight", 0.0)),
+        "joint_train_action_expert": bool(getattr(args, "joint_train_action_expert", getattr(model, "joint_train_action_expert", True))),
         "grad_clip_norm": float(getattr(args, "grad_clip_norm", 0.0)),
         "architecture_revision": ARCHITECTURE_REVISION,
         "lora": spec,
@@ -846,7 +897,10 @@ def main():
     if args.stage == "joint":
         configure_lora(model, args)
     model.set_training_stage(args.stage)
-    trainable = configure_trainable_parameters(model, args.stage)
+    trainable = configure_trainable_parameters(
+        model, args.stage,
+        train_action_expert=(args.joint_train_action_expert if args.stage == "joint" else None),
+    )
     model.train()
     if args.stage == "joint":
         set_lora_train_mode(model.policy, True)
@@ -891,7 +945,10 @@ def main():
         _load_init_adapter(args.init_adapter, model, args, base_meta, data_contract)
         # The source adapter can contain bridge/expert weights; restore the
         # exact target-stage trainable surface afterward.
-        trainable = configure_trainable_parameters(model, args.stage)
+        trainable = configure_trainable_parameters(
+            model, args.stage,
+            train_action_expert=(args.joint_train_action_expert if args.stage == "joint" else None),
+        )
         model.train()
         if args.stage == "joint":
             set_lora_train_mode(model.policy, True)
@@ -908,7 +965,7 @@ def main():
 
     if args.stage in ("bridge", "expert"):
         add_group("bridge", model.bridge_parameters(), args.lr)
-    if args.stage in ("expert", "joint"):
+    if args.stage == "expert" or (args.stage == "joint" and args.joint_train_action_expert):
         add_group("action_head", model.action_parameters(), args.action_lr)
     if args.stage == "joint":
         add_group("lora", (p for m in lora_modules(model.policy).values() for p in (m.lora_A, m.lora_B)), args.base_lr)
@@ -1002,6 +1059,7 @@ def main():
                     device,
                     args.kd_weight,
                     teacher_policy=teacher_policy,
+                    native_kd_weight=args.native_kd_weight if args.stage == "joint" else 0.0,
                 )
                 if isinstance(total, torch.Tensor) and total.requires_grad:
                     total.backward()

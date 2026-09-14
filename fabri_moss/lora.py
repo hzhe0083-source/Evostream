@@ -3,11 +3,18 @@
 from __future__ import annotations
 
 import math
+from contextvars import ContextVar
+from contextlib import contextmanager
 from typing import Dict, Iterable, Mapping, Tuple
 
 import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
+
+
+_LORA_CONTEXT: ContextVar[Tuple[bool, Tensor | None]] = ContextVar(
+    "fabri_moss_lora_context", default=(True, None)
+)
 
 
 class FP32LoRALinear(nn.Module):
@@ -76,8 +83,19 @@ class FP32LoRALinear(nn.Module):
         if base_weight is not None and base_input.dtype != base_weight.dtype:
             base_input = base_input.to(dtype=base_weight.dtype)
         base_out = self.base(base_input, *args, **kwargs)
+        lora_enabled, sample_mask = _LORA_CONTEXT.get()
+        if not lora_enabled:
+            return base_out
         residual = F.linear(self.dropout(input.float()), self.lora_A)
         residual = F.linear(residual, self.lora_B).mul(self.scaling)
+        if sample_mask is not None:
+            sample_mask = sample_mask.to(device=residual.device, dtype=residual.dtype).flatten()
+            if input.ndim == 0 or input.shape[0] != sample_mask.numel():
+                raise ValueError(
+                    "LoRA sample mask must match the first input dimension: "
+                    f"input={tuple(input.shape)}, mask={tuple(sample_mask.shape)}"
+                )
+            residual = residual * sample_mask.view(-1, *([1] * (residual.ndim - 1)))
         return base_out + residual.to(dtype=base_out.dtype, device=base_out.device)
 
     def _apply(self, fn):
@@ -191,3 +209,27 @@ def set_lora_train_mode(root: nn.Module, training: bool = True) -> None:
         # Keep the frozen native projection in eval mode; only the residual's
         # dropout needs a training flag.
         module.dropout.train(training)
+
+
+@contextmanager
+def lora_context(
+    root: nn.Module,
+    *,
+    enabled: bool = True,
+    sample_mask: Tensor | None = None,
+):
+    """Temporarily enable LoRA, optionally per batch sample.
+
+    Native current-only queries use ``enabled=False`` to preserve FabriVLA
+    exactly.  Mixed batches pass a boolean ``sample_mask`` so only samples
+    with historical FrameKV receive the residual.
+    """
+    if sample_mask is not None:
+        if sample_mask.ndim != 1 or sample_mask.dtype != torch.bool:
+            raise ValueError("sample_mask must be a one-dimensional bool tensor")
+        sample_mask = sample_mask.detach()
+    token = _LORA_CONTEXT.set((bool(enabled), sample_mask))
+    try:
+        yield
+    finally:
+        _LORA_CONTEXT.reset(token)

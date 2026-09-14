@@ -15,6 +15,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from fabri_moss.delta import DeltaMemoryState, delta_read, delta_update
+from fabri_moss.lora import lora_context
 
 
 # This is a data-contract marker, not the mutable model ``_revision``.  A
@@ -357,6 +358,21 @@ class MossInternVL(nn.Module):
         head = getattr(self.policy, "action_head", None)
         if head is not None:
             yield from head.parameters()
+
+    def _forward_native_layer(
+        self,
+        native_layer: nn.Module,
+        hidden_states: torch.Tensor,
+        *,
+        lora_enabled: bool = True,
+        lora_mask=None,
+        **kwargs,
+    ):
+        # LoRA is an optional Joint-stage adapter.  Keep it off for the native
+        # current-only path; in a mixed batch apply it only to samples that
+        # actually have historical FrameKV.
+        with lora_context(self.policy, enabled=lora_enabled, sample_mask=lora_mask):
+            return native_layer(hidden_states, **kwargs)
 
     @staticmethod
     def _is_vision_name(name: str) -> bool:
@@ -991,8 +1007,10 @@ class MossInternVL(nn.Module):
         for layer_idx_0, native_layer in enumerate(core.layers):
             current_layer_1based = layer_idx_0 + 1
 
-            layer_outputs = native_layer(
+            layer_outputs = self._forward_native_layer(
+                native_layer,
                 hidden_states,
+                lora_enabled=bool(memory_matrices is not None or memory_frames),
                 attention_mask=causal_mask,
                 position_ids=position_ids,
                 past_key_value=None,
@@ -1200,8 +1218,10 @@ class MossInternVL(nn.Module):
         shallow_states = None
         cross_seen = False
         for layer_num, native_layer in enumerate(core.layers, start=1):
-            out = native_layer(
+            out = self._forward_native_layer(
+                native_layer,
                 h,
+                lora_mask=has_visible_memory,
                 attention_mask=native_mask_after_cross if cross_seen else native_mask,
                 position_ids=position_ids,
                 past_key_value=None, output_attentions=False, use_cache=False,

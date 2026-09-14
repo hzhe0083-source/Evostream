@@ -36,6 +36,10 @@ CADENCE_ARGS=()
 if [[ -n "${MOSS_DECISION_STRIDE:-}" ]]; then
     CADENCE_ARGS+=(--decision-stride "$MOSS_DECISION_STRIDE")
 fi
+NATIVE_KD_ARGS=()
+if [[ -n "${MOSS_NATIVE_KD_WEIGHT:-}" ]]; then
+    NATIVE_KD_ARGS+=(--native-kd-weight "$MOSS_NATIVE_KD_WEIGHT")
+fi
 
 exec env \
     PYTHONPATH="/root/FabriVLA/diagnostics/fa2_repro_20260908/python_packages:$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}" \
@@ -52,5 +56,6 @@ exec env \
     --min-context-frames "${MOSS_MIN_CONTEXT_FRAMES:-1}" \
     --execution-horizon "${MOSS_EXECUTION_HORIZON:-5}" \
     "${CADENCE_ARGS[@]}" \
+    "${NATIVE_KD_ARGS[@]}" \
     "$@" \
     --output-dir "$OUTPUT_DIR"
